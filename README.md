@@ -179,6 +179,40 @@ on all valid (non-NaN) frames:
 (which are often right-skewed due to occasional large values), these are particularly
 informative about the proportion of time a child spends in "extreme" movement states.
 
+**IQR-based outlier clipping for spread and higher-order statistics:** Normalised variants
+divide every frame value by trunk height. When trunk height is momentarily mis-estimated
+(a common MMPose artefact — e.g. person crouching or occluded), the division produces
+spikes that are 10–100× the typical value, inflating `std`, `cv`, `skewness`, and
+`kurtosis` for a single subject, driving PCA and tree splits with no biological meaning.
+
+To prevent this, per-subject frame values are clipped to the Tukey IQR fences
+`[Q1 − 3·IQR, Q3 + 3·IQR]` **before** computing spread and higher-order statistics.
+This strategy is adaptive: for a metric with IQR=0.1, the upper fence sits at Q3 + 0.3,
+which is far more aggressive toward artefacts than a fixed p99 (which could still be 50×
+above Q3 if 60 artefact frames inflate the tail). At the same time, genuine behavioural
+peaks (fast gestures = a handful of frames) sit well within the fence.
+
+| Statistic | Computed on | Rationale |
+|-----------|-------------|-----------|
+| `mean` | original frames | Unbiased estimate of central tendency |
+| `q10`, `q25`, `median`, `q75`, `q90`, `iqr` | original frames | Percentile-based, inherently robust |
+| `std` | IQR-clipped frames | Removes inflation from artefact spikes |
+| `cv` | IQR-clipped frames | cv = std_clipped / mean_clipped |
+| `skewness` | IQR-clipped frames | 3rd-power moment; highly sensitive to extremes |
+| `kurtosis` | IQR-clipped frames | 4th-power moment; even more sensitive |
+
+**p10 / p90 replace min / max:** `min` of a non-negative metric (e.g. `acceleration_trunk`)
+is ≈ 0 for almost every subject (there is always a near-constant-speed frame), giving a
+near-zero cross-subject IQR — even a difference of 6×10⁻⁵ vs 10⁻⁶ becomes 30 IQRs after
+robust scaling and dominates PC1. `max` is a single artefact frame.
+`q10` ("typical low activity") and `q90` ("typical peak activity") are semantically
+meaningful and robust to up to 10% artefact frames.
+
+> **Before this fix:** 14 subjects had PC1 > 400 in the PCA embedding despite the earlier
+> cv and kurtosis fixes; the worst (`acceleration_trunk__norm__min` = 6.2×10⁻⁵) was
+> 30 IQRs from the median. After the fix the PCA embedding reflects genuine behavioural
+> structure.
+
 **CV and signed metrics:** `cv = std / mean` is only meaningful for non-negative signals
 where the mean represents a genuine level. Several metrics are **signed** — they encode
 direction and their mean is forced towards zero over a long recording as positive and
@@ -207,6 +241,8 @@ filtering, these 18 cv features are automatically removed during preprocessing.
   keypoint set changed); other statistics are set to NaN
 - Metrics with fewer than 50 valid frames — all statistics set to NaN (insufficient data)
 - **Signed metrics** — `cv` set to NaN when `|mean| ≤ 0.01 × std` (see above)
+- **Spread / higher-order moments** — `std`, `cv`, `skewness`, `kurtosis` computed on IQR-clipped frames (Tukey fences k=3); see table above
+- **`min` / `max` replaced by `q10` / `q90`** — robust to degenerate near-zero distributions and single-frame artefacts; see rationale above
 
 ### Feature count
 

@@ -38,8 +38,8 @@ MIN_VALID_FRAMES = 50
 
 # stat_types computed for float metrics
 FLOAT_STAT_TYPES = [
-    "mean", "std", "q25", "median", "q75", "iqr",
-    "min", "max", "cv", "skewness", "kurtosis",
+    "mean", "std", "q10", "q25", "median", "q75", "q90", "iqr",
+    "cv", "skewness", "kurtosis",
 ]
 
 # stat_types computed for boolean metrics (kp_set_changed)
@@ -59,26 +59,62 @@ def _stats_float(arr: np.ndarray) -> dict[str, float]:
     if len(valid) < MIN_VALID_FRAMES:
         return {s: np.nan for s in FLOAT_STAT_TYPES}
 
-    q25, median, q75 = np.percentile(valid, [25, 50, 75])
+    q10, q25, median, q75, q90 = np.percentile(valid, [10, 25, 50, 75, 90])
     mean = float(np.mean(valid))
-    std = float(np.std(valid, ddof=1))
     iqr = float(q75 - q25)
 
-    cv = std / mean if abs(mean) > 0.01 * std else np.nan
+    # IQR-based Tukey fence clipping (k=3) before computing spread and
+    # higher-order statistics.
+    #
+    # Context: the normalised variant divides every frame value by trunk height.
+    # When trunk height is momentarily mis-estimated (a common MMPose artefact)
+    # the division produces spikes that are 10–100× the typical value for that
+    # subject.  A fixed percentile clip (e.g. p1/p99) does not adapt to the
+    # metric's scale and can still include burst artefacts lasting several
+    # seconds (>1% of frames).
+    #
+    # IQR-based clipping is adaptive and well-motivated:
+    #   lower fence = Q1 − 3·IQR  (equivalent to ~±4σ for Gaussian data)
+    #   upper fence = Q3 + 3·IQR
+    # Frames outside these fences are replaced by the fence value.  This
+    # removes tracking artefacts while preserving genuine movement peaks
+    # (fast gestures = only a few frames, well inside the fence).
+    #
+    # Statistics computed on original (unclipped) frames:
+    #   mean, q10, q25, median, q75, q90, iqr
+    #
+    # Statistics computed on IQR-clipped frames:
+    #   std, cv, skewness, kurtosis  — all sensitive to extreme frame values
+    #
+    # p10 / p90 replace min / max:
+    #   min / max of a non-negative metric (e.g. acceleration) is essentially
+    #   0 / a single artefact frame, giving near-zero IQR and degenerate
+    #   robust-scaled values.  p10 = "typical low" and p90 = "typical high"
+    #   behaviour over the session are semantically meaningful and robust.
+    if iqr > 0:
+        lo = q25 - 3.0 * iqr
+        hi = q75 + 3.0 * iqr
+    else:
+        # Metric is constant (e.g. angle locked at 0); std/cv/moments are 0.
+        lo, hi = q25, q75
+    valid_wins = np.clip(valid, lo, hi)
+    std = float(np.std(valid_wins, ddof=1))
+    mean_wins = float(np.mean(valid_wins))
+    cv = std / mean_wins if abs(mean_wins) > 0.01 * std else np.nan
 
     with np.errstate(all="ignore"):
-        skewness = float(scipy_stats.skew(valid, bias=False))
-        kurtosis = float(scipy_stats.kurtosis(valid, bias=False))  # excess kurtosis
+        skewness = float(scipy_stats.skew(valid_wins, bias=False))
+        kurtosis = float(scipy_stats.kurtosis(valid_wins, bias=False))  # excess kurtosis
 
     return {
         "mean": mean,
         "std": std,
+        "q10": float(q10),
         "q25": float(q25),
         "median": float(median),
         "q75": float(q75),
+        "q90": float(q90),
         "iqr": iqr,
-        "min": float(np.min(valid)),
-        "max": float(np.max(valid)),
         "cv": cv,
         "skewness": skewness,
         "kurtosis": kurtosis,

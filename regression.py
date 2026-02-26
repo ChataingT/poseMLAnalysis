@@ -288,7 +288,8 @@ def run_regression(
     ados_strat = build_ados_strat(ados_series)
     diag_series = df_meta.get("diagnosis", pd.Series("unknown", index=df_meta.index))
 
-    model_defs = _build_models(use_gpu=use_gpu, n_jobs=1, random_state=random_state)
+    # Always use CPU for XGB/LGBM during CV (same rationale as classification).
+    model_defs = _build_models(use_gpu=False, n_jobs=1, random_state=random_state)
     logger.info(f"Regression: {len(model_defs)} models, {n_outer}×{n_inner} nested CV")
 
     outer_cv = StratifiedKFold(n_splits=n_outer, shuffle=True, random_state=random_state)

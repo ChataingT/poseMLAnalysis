@@ -86,7 +86,6 @@ def _build_models(use_gpu: bool = False, n_jobs: int = -1, random_state: int = 4
         xgb_est = XGBClassifier(
             device=xgb_device, eval_metric="logloss",
             random_state=random_state, nthread=max(1, n_jobs),
-            use_label_encoder=False,
         )
         xgb_params = {
             "model__n_estimators": [100, 300, 500],
@@ -348,7 +347,12 @@ def run_classification(
     strat_label = build_strat_label(df_meta)
     strat_arr = strat_label.values
 
-    model_defs = _build_models(use_gpu=use_gpu, n_jobs=1, random_state=random_state)
+    # Always use CPU for XGB/LGBM during CV:  with 119 subjects the GPU
+    # data-transfer overhead far exceeds compute time, and running 5 concurrent
+    # loky forks each with a LightGBM GPU instance exhausts host memory before
+    # the first tree is trained (LightGBM allocates large host-side bin buffers
+    # per Booster regardless of dataset size when device='gpu').
+    model_defs = _build_models(use_gpu=False, n_jobs=1, random_state=random_state)
     logger.info(f"Classification: {len(model_defs)} models, {n_outer}×{n_inner} nested CV")
 
     outer_cv = StratifiedKFold(n_splits=n_outer, shuffle=True, random_state=random_state)
