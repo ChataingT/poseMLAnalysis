@@ -3,15 +3,15 @@ Nested cross-validated regression: predict ADOS-2 total score.
 
 Six models:
   dt    DecisionTreeRegressor(max_depth=4)        baseline
-  ridge ElasticNet                                linear baseline
+  ridge ElasticNet (alpha, l1_ratio grid)         linear baseline with L1+L2 regularisation
   svr   SVR(kernel='rbf')                         classic
   rf    RandomForestRegressor(n_estimators=500)   ensemble
   xgb   XGBRegressor                             gradient boosting
   lgbm  LGBMRegressor                            fast gradient boosting
 
 CV scheme (ADOS quintile stratification):
-  Outer: StratifiedKFold(5) on ados_quintile
-    └─ Inner: StratifiedKFold(3) on ados_quintile
+  Outer: StratifiedKFold(5, shuffle=True) on ados_quintile
+    └─ Inner: StratifiedKFold(3, shuffle=True) on ados_quintile
          └─ RandomizedSearchCV(n_iter=50, scoring='neg_root_mean_squared_error')
 
 Subjects with missing ADOS are excluded.
@@ -22,12 +22,14 @@ Model comparison: Wilcoxon signed-rank on outer-fold RMSE vectors (Bonferroni co
 Outputs (under output_dir/regression/):
   cv_results_all_models.csv
   model_comparison.csv
+  predictions_per_subject.csv              out-of-fold predicted ADOS per subject × model
   predicted_vs_actual_{model}.png    out-of-fold predicted vs true ADOS
   residuals_{model}.png              residual distribution
 """
 
 from __future__ import annotations
 
+import copy
 import logging
 import warnings
 from itertools import combinations
@@ -42,6 +44,7 @@ from scipy.stats import pearsonr, spearmanr, wilcoxon
 from sklearn.linear_model import ElasticNet
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from sklearn.model_selection import RandomizedSearchCV, StratifiedKFold
+from sklearn.pipeline import Pipeline
 from sklearn.svm import SVR
 from sklearn.tree import DecisionTreeRegressor
 from sklearn.ensemble import RandomForestRegressor
@@ -67,9 +70,13 @@ PALETTE_MODELS = {
 # ─────────────────────────────────────────────────────────────
 
 def _build_models(use_gpu: bool = False, n_jobs: int = -1, random_state: int = 42):
+    """Return dict of (model_id → (estimator, param_distributions)) for regression.
+
+    XGBoost and LightGBM are included only when the respective package is available.
+    """
     try:
         from xgboost import XGBRegressor
-        xgb_device = "cuda" if use_gpu else "hist"
+        xgb_device = "cuda" if use_gpu else "cpu"
         xgb_est = XGBRegressor(
             device=xgb_device, random_state=random_state, nthread=max(1, n_jobs),
         )
@@ -183,6 +190,29 @@ def _run_one_fold(
     random_state: int,
     n_jobs_inner: int,
 ) -> list[dict]:
+    """Run all regression models for one outer fold.
+
+    Fits a preprocessing + model pipeline for each model, tunes hyperparameters
+    with inner RandomizedSearchCV, and evaluates on the held-out test fold.
+
+    Args:
+        fold_idx: Outer fold index (0-based), stored in every result row.
+        train_idx: Row indices of the training set in ``X``.
+        test_idx: Row indices of the test set in ``X``.
+        X: Full (raw, un-preprocessed) feature matrix.
+        y: Full ADOS-2 total score vector (ADOS-valid subjects only).
+        model_defs: Dict returned by ``_build_models``.
+        n_inner: Number of inner CV folds.
+        n_iter: RandomizedSearchCV iterations per model.
+        ados_strat: Integer quintile-bin array used for stratified inner CV.
+        corr_threshold: Correlation filter threshold for preprocessing.
+        random_state: Random seed forwarded to all stochastic components.
+        n_jobs_inner: Parallel jobs for inner RandomizedSearchCV.
+
+    Returns:
+        List of result dicts, one per model, containing scalar metrics plus
+        raw ``y_pred``, ``y_test``, and ``test_indices`` (for per-subject saving).
+    """
     X_train, X_test = X[train_idx], X[test_idx]
     y_train, y_test = y[train_idx], y[test_idx]
     strat_train = ados_strat[train_idx]
@@ -191,8 +221,6 @@ def _run_one_fold(
     fold_results = []
 
     for model_id, (estimator, param_dist) in model_defs.items():
-        import copy
-        from sklearn.pipeline import Pipeline
         est = copy.deepcopy(estimator)
         preproc = build_preprocessing_pipeline(corr_threshold=corr_threshold)
         pipe = Pipeline(list(preproc.steps) + [("model", est)])
@@ -376,6 +404,18 @@ def run_regression(
 # ─────────────────────────────────────────────────────────────
 
 def _model_comparison(df_cv: pd.DataFrame, metric: str = "rmse") -> pd.DataFrame:
+    """Compute mean ± std and pairwise Wilcoxon signed-rank p-values (Bonferroni).
+
+    Args:
+        df_cv: Per-fold per-model results DataFrame (from ``run_regression``).
+        metric: Column name used for comparison. Default is ``'rmse'``
+            (lower-is-better; determines sort order of the returned DataFrame).
+
+    Returns:
+        DataFrame with one row per model, sorted by mean metric.
+        Columns: ``{metric}_mean``, ``{metric}_std``, and ``p_vs_{other}_bonf``
+        for every model pair.
+    """
     models = df_cv["model"].unique()
     vals_by_model = {m: df_cv[df_cv["model"] == m][metric].values for m in models}
 
@@ -417,6 +457,11 @@ def _model_comparison(df_cv: pd.DataFrame, metric: str = "rmse") -> pd.DataFrame
 # ─────────────────────────────────────────────────────────────
 
 def _plot_pred_vs_actual(y_true, y_pred, model_id, out):
+    """Scatter plot of out-of-fold predicted vs true ADOS-2 total scores.
+
+    Overlays the ideal y=x line and a least-squares regression line, and
+    annotates RMSE, R², Spearman ρ, and Pearson r in the title.
+    """
     fig, ax = plt.subplots(figsize=(6, 5))
     ax.scatter(y_true, y_pred, alpha=0.65, s=40, color=PALETTE_MODELS.get(model_id, "steelblue"),
                edgecolors="white", linewidths=0.4)
@@ -455,6 +500,12 @@ def _plot_pred_vs_actual(y_true, y_pred, model_id, out):
 
 
 def _plot_residuals(y_true, y_pred, model_id, out):
+    """Two-panel residual diagnostic plot.
+
+    Left panel: histogram of residuals (predicted − true), with a vertical
+    dashed line at zero.  Right panel: residuals vs predicted values, useful
+    for detecting heteroscedasticity or systematic bias.
+    """
     residuals = y_pred - y_true
     fig, axes = plt.subplots(1, 2, figsize=(11, 4))
 

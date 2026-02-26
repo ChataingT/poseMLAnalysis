@@ -608,6 +608,8 @@ ml_analysis/results/
 ├── classification/
 │   ├── cv_results_all_models.csv      Per-fold per-model scores (5 folds × 6 models)
 │   ├── model_comparison.csv           Mean ± std + pairwise Wilcoxon p (Bonferroni)
+│   ├── predictions_per_subject.csv    Out-of-fold predicted probability + label per subject
+│   ├── roc_curve_data.csv             FPR/TPR/threshold per fold × model
 │   ├── roc_curves.png
 │   ├── confusion_matrices.png
 │   └── learning_curves.png
@@ -615,10 +617,14 @@ ml_analysis/results/
 ├── regression/
 │   ├── cv_results_all_models.csv
 │   ├── model_comparison.csv
+│   ├── predictions_per_subject.csv    Out-of-fold predicted ADOS per subject × model
 │   ├── predicted_vs_actual_{dt|ridge|svr|rf|xgb|lgbm}.png
 │   └── residuals_{dt|ridge|svr|rf|xgb|lgbm}.png
 │
 └── explain/
+    ├── shap_values_{classification|regression}_{model}.csv
+    ├── shap_feature_values_{classification|regression}_{model}.csv
+    ├── shap_importance_{classification|regression}_{model}.csv
     ├── shap_beeswarm_{classification|regression}_{model}.png
     ├── shap_bar_{classification|regression}_{model}.png
     ├── shap_dependence_{rank}_{feature}_{task}_{model}.png

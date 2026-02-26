@@ -108,7 +108,7 @@ Models searched:
 | `lr` | `LogisticRegression(penalty='elasticnet', solver='saga')` |
 | `svm` | `SVC(kernel='rbf', probability=True)` |
 | `rf` | `RandomForestClassifier(n_estimators=500, class_weight='balanced')` |
-| `xgb` | `XGBClassifier(tree_method='hist'/'cuda')` |
+| `xgb` | `XGBClassifier(device='cpu'/'cuda')` |
 | `lgbm` | `LGBMClassifier(device='cpu'/'gpu')` |
 
 ### Per-fold metrics
@@ -163,11 +163,10 @@ Models searched:
 | ID | Model |
 |----|-------|
 | `dt` | `DecisionTreeRegressor(max_depth=4)` |
-| `ridge` | `Ridge` (alpha grid) |
-| `elasticnet` | `ElasticNet` (alpha, l1_ratio grid) |
+| `ridge` | `ElasticNet` (alpha, l1_ratio grid) |
 | `svr` | `SVR(kernel='rbf')` |
 | `rf` | `RandomForestRegressor(n_estimators=500)` |
-| `xgb` | `XGBRegressor(tree_method='hist'/'cuda')` |
+| `xgb` | `XGBRegressor(device='cpu'/'cuda')` |
 | `lgbm` | `LGBMRegressor(device='cpu'/'gpu')` |
 
 ### Per-fold metrics

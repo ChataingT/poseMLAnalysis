@@ -11,18 +11,21 @@ Six models:
 
 CV scheme (joint stratification on diagnosis × ADOS tertile):
   Outer: StratifiedKFold(5, shuffle=True, random_state=42)
-    └─ Inner: StratifiedKFold(3)
+    └─ Inner: StratifiedKFold(3, shuffle=True)
          └─ RandomizedSearchCV(n_iter=50, scoring='roc_auc')
 
 SMOTE is applied inside each inner training fold.
 Feature preprocessing is fit inside each inner training fold.
 
-Metrics: AUC-ROC (primary), balanced accuracy, F1-macro, sensitivity, specificity.
+Metrics: AUC-ROC (primary), balanced accuracy, F1-macro, F1-weighted,
+         sensitivity (TPR), specificity (TNR).
 Model comparison: Wilcoxon signed-rank on outer-fold AUC vectors (Bonferroni corrected).
 
 Outputs (under output_dir/classification/):
   cv_results_all_models.csv    per-fold per-model scores
   model_comparison.csv         mean ± std + pairwise Wilcoxon p-values
+  predictions_per_subject.csv  out-of-fold predicted probability and label per subject
+  roc_curve_data.csv           FPR/TPR/threshold per fold × model
   roc_curves.png               all models overlaid (mean ± std band)
   confusion_matrices.png       aggregated across folds, one per model
   learning_curves.png          RF + XGB train vs val AUC vs training size
@@ -30,6 +33,7 @@ Outputs (under output_dir/classification/):
 
 from __future__ import annotations
 
+import copy
 import logging
 import warnings
 from itertools import combinations
@@ -82,11 +86,10 @@ def _build_models(use_gpu: bool = False, n_jobs: int = -1, random_state: int = 4
     """Return dict of (model_id → (estimator, param_distributions))."""
     try:
         from xgboost import XGBClassifier
-        xgb_device = "cuda" if use_gpu else "hist"
+        xgb_device = "cuda" if use_gpu else "cpu"
         xgb_est = XGBClassifier(
             device=xgb_device, eval_metric="logloss",
             random_state=random_state, nthread=max(1, n_jobs),
-            use_label_encoder=False,
         )
         xgb_params = {
             "model__n_estimators": [100, 300, 500],
@@ -244,7 +247,6 @@ def _run_one_fold(
     fold_results = []
 
     for model_id, (estimator, param_dist) in model_defs.items():
-        import copy
         est = copy.deepcopy(estimator)
         preproc = build_preprocessing_pipeline(corr_threshold=corr_threshold)
         pipe = _make_pipeline_with_smote(est, preproc, random_state=random_state)
@@ -604,7 +606,6 @@ def _plot_learning_curves(X, y, strat_arr, model_defs, out,
 
     for idx, (model_id, (estimator, _)) in enumerate(lc_models.items()):
         ax = axes[0][idx]
-        import copy
         est = copy.deepcopy(estimator)
         preproc = build_preprocessing_pipeline(corr_threshold=corr_threshold)
 

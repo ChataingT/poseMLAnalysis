@@ -9,7 +9,7 @@ Builds on pose_analysis correlation results with:
   - SHAP explainability for best models
 
 Usage:
-    python run_ml.py \\
+    python -m ml_analysis.run_ml \\
         --csv      /path/to/child_for_humanlisbet_paper_with_paths.csv \\
         --pose-records /path/to/pose_records/ \\
         --output-dir ml_analysis/results/
