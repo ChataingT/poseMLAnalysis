@@ -171,7 +171,7 @@ on all valid (non-NaN) frames:
 | `iqr` | q75 − q25 | robust spread |
 | `min` | minimum | floor of signal |
 | `max` | maximum | ceiling / peak |
-| `cv` | std / mean | normalised variability (relative to mean) |
+| `cv` | std / mean | normalised variability (relative to mean) — **NaN for signed metrics** (see note) |
 | `skewness` | Fisher skewness (bias=False) | asymmetry of distribution |
 | `kurtosis` | excess kurtosis (bias=False) | tail heaviness vs Gaussian |
 
@@ -179,11 +179,34 @@ on all valid (non-NaN) frames:
 (which are often right-skewed due to occasional large values), these are particularly
 informative about the proportion of time a child spends in "extreme" movement states.
 
+**CV and signed metrics:** `cv = std / mean` is only meaningful for non-negative signals
+where the mean represents a genuine level. Several metrics are **signed** — they encode
+direction and their mean is forced towards zero over a long recording as positive and
+negative values cancel:
+
+| Signed metric | Why the mean ≈ 0 |
+|---------------|-----------------|
+| `velocity_centroid_x/y` | Horizontal/vertical displacement: moves left AND right roughly equally |
+| `velocity_trunk_x/y` | Same, restricted to trunk keypoints |
+| `interpersonal_approach` | Rate of change of distance: approach and retreat cancel over a session |
+
+For these metrics `cv = std / near_zero ≈ ∞`, which is meaningless and numerically
+unstable. The implementation guards against this with a relative threshold:
+`cv = NaN if |mean| ≤ 0.01 × std`. After imputation (median ≈ 0) and near-zero variance
+filtering, these 18 cv features are automatically removed during preprocessing.
+
+> **Why this matters for PCA:** Before this fix, subject `7892_Visite2_Recherche` had
+> `clinician_velocity_centroid_x__cv ≈ 1,191,280` (mean ≈ 2×10⁻⁹, a floating-point
+> near-zero). After `RobustScaler` this produced a value ~3,600× the IQR, causing PC1
+> to point almost entirely at this one subject and explain 94.4% of variance — an artefact
+> with no biological meaning.
+
 **Special handling:**
 - `segment_id` column — skipped entirely (not a metric)
 - `kp_set_changed` (bool) — only `mean` computed (proportion of frames where the visible
   keypoint set changed); other statistics are set to NaN
 - Metrics with fewer than 50 valid frames — all statistics set to NaN (insufficient data)
+- **Signed metrics** — `cv` set to NaN when `|mean| ≤ 0.01 × std` (see above)
 
 ### Feature count
 

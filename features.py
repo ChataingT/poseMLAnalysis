@@ -64,7 +64,7 @@ def _stats_float(arr: np.ndarray) -> dict[str, float]:
     std = float(np.std(valid, ddof=1))
     iqr = float(q75 - q25)
 
-    cv = std / mean if mean != 0 else np.nan
+    cv = std / mean if abs(mean) > 0.01 * std else np.nan
 
     with np.errstate(all="ignore"):
         skewness = float(scipy_stats.skew(valid, bias=False))
