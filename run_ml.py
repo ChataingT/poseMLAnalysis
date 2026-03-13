@@ -378,6 +378,8 @@ def main(argv=None) -> None:
                 corr_threshold=args.corr_threshold,
                 use_gpu=args.use_gpu,
                 random_state=random_state,
+                X_reg=X_reg_explain if df_cv_reg is not None else None,
+                df_meta_reg=df_meta_reg_explain if df_cv_reg is not None else None,
             )
         except Exception as exc:
             logger.error(f"Explainability failed: {exc}", exc_info=True)

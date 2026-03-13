@@ -507,22 +507,30 @@ def run_explainability(
     corr_threshold: float = 0.95,
     use_gpu: bool = False,
     random_state: int = 42,
+    X_reg: np.ndarray | None = None,
+    df_meta_reg: pd.DataFrame | None = None,
 ) -> None:
     """
     Run SHAP explainability for best classification and (optionally) regression models.
 
     Args:
-        X: Raw feature matrix (preprocessing done inside this function).
+        X: Raw feature matrix for classification (all subjects, preprocessing done inside).
         y_clf: Binary labels (0=TD, 1=ASD).
-        y_reg: Continuous ADOS scores (None to skip regression explain).
-        df_meta: Clinical metadata.
-        feature_names: Names of columns in X.
-        df_cv_clf: Classification CV results DataFrame.
-        df_cv_reg: Regression CV results DataFrame (or None).
+        y_reg: Continuous ADOS scores for regression (None to skip regression explain).
+            Must be restricted to subjects with valid ADOS scores; ``X_reg`` must match.
+        df_meta: Clinical metadata aligned to ``X`` (classification subjects).
+        feature_names: Names of columns in ``X`` (and ``X_reg``).
+        df_cv_clf: Classification CV results DataFrame (from ``run_classification``).
+        df_cv_reg: Regression CV results DataFrame (from ``run_regression``, or None).
         output_dir: Root output directory.
         corr_threshold: Preprocessing correlation threshold.
         use_gpu: Use GPU for tree models.
         random_state: Random seed.
+        X_reg: Raw feature matrix restricted to subjects with valid ADOS scores.
+            Required when ``y_reg`` is not None.  Defaults to ``X`` if not provided,
+            but callers must ensure ``X_reg.shape[0] == len(y_reg)``.
+        df_meta_reg: Clinical metadata aligned to ``X_reg`` (ADOS-valid subjects only).
+            Defaults to ``df_meta`` if not provided.
     """
     out = output_dir / "explain"
     out.mkdir(parents=True, exist_ok=True)
@@ -566,10 +574,15 @@ def run_explainability(
     # ── Regression ────────────────────────────────────────────
     if y_reg is not None and df_cv_reg is not None:
         logger.info("── SHAP: Regression ──")
+        # Use the ADOS-valid-only feature matrix and metadata if provided.
+        # Falling back to the full X / df_meta is only safe when all subjects
+        # have valid ADOS scores; in the general case callers must supply X_reg.
+        X_for_reg = X_reg if X_reg is not None else X
+        df_meta_for_reg = df_meta_reg if df_meta_reg is not None else df_meta
         try:
             best_reg_id, pipe_reg, X_reg_t, names_reg = _retrain_best(
                 df_cv=df_cv_reg,
-                X=X,
+                X=X_for_reg,
                 y=y_reg,
                 metric="rmse",
                 lower_is_better=True,
@@ -582,9 +595,7 @@ def run_explainability(
             shap_reg, explainer_reg = _get_shap_values(
                 best_reg_id, pipe_reg, X_reg_t, task="regression", random_state=random_state
             )
-            # Use df_meta subset that matches y_reg (subjects with valid ADOS)
-            df_meta_reg = df_meta.iloc[:len(X_reg_t)].reset_index(drop=True) if len(X_reg_t) < len(df_meta) else df_meta
-            _save_shap_data(shap_reg, X_reg_t, names_reg, df_meta_reg,
+            _save_shap_data(shap_reg, X_reg_t, names_reg, df_meta_for_reg,
                             "regression", best_reg_id, out)
             _plot_beeswarm(shap_reg, X_reg_t, names_reg, "regression", best_reg_id, out)
             _plot_bar(shap_reg, names_reg, "regression", best_reg_id, out)
