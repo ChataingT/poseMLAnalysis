@@ -48,9 +48,38 @@ from .preprocessing import (
     generate_feature_selection_report,
 )
 from .dimreduce import run_dimensionality_reduction
-from .classification import run_classification, build_strat_label
+from .classification import run_classification, build_strat_label, build_strat_label_from_y
 from .regression import run_regression, build_ados_strat
 from .explain import run_explainability
+from .config import load_config, validate_config, apply_config, exploratory_settings
+
+
+# ─────────────────────────────────────────────────────────────
+# All known target columns (from the CSV)
+# ─────────────────────────────────────────────────────────────
+
+ALL_TARGET_COLS = [
+    # ADOS-2
+    "ADOS_2_ADOS_G_revised_RRB_level_of_symptoms",
+    "ADOS_2_ADOS_G_REVISED_RRB_SEVERITY_SCORE_new",
+    "ADOS_2_ADOS_G_REVISED_SA_LEVEL_OF_SYMPTOMS",
+    "ADOS_2_ADOS_G_REVISED_SA_SEVERITY_SCORE",
+    "ADOS_2_SOCIAL_AFECT_TOTAL",
+    "ADOS_2_TOTAL",
+    "ADOS_G_ADOS_2_TOTAL_score_de_severite",
+    "ADOS_G_REVISED_ADOS_2_TOTAL_Level_of_symptoms",
+    # Diagnosis / demographics
+    "diagnosis",
+    "gender",
+    # Vineland-II (VLDII)
+    "VLDII_AdSS", "VLDII_MotorSS", "VLDII_gmsVS", "VLDII_fmsVS",
+    "VLDII_SocSS", "VLDII_intVS", "VLDII_plaVS", "VLDII_copVS",
+    "VLDII_DaiSS", "VLDII_perVS", "VLDII_comVS", "VLDII_domVS",
+    "VLDII_ComSS", "VLDII_expVS", "VLDII_recVS",
+    # Mullen (MSEL)
+    "MSEL_TOTAL_DQ", "MSEL_FM_DQ", "MSEL_VR_DQ", "MSEL_LR_DQ",
+    "MSEL_LE_DQ", "MSEL_NV_DQ", "MSEL_V_DQ", "MSEL_GM_DQ",
+]
 
 
 # ─────────────────────────────────────────────────────────────
@@ -135,6 +164,16 @@ def parse_args(argv=None) -> argparse.Namespace:
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
         help="Logging verbosity (default: INFO)",
     )
+    parser.add_argument(
+        "--config", default=None, type=Path,
+        help=(
+            "Path to a YAML (or JSON) config file. "
+            "When provided, runs in config mode: only the specified methods and models "
+            "are executed; fixed hyperparameters skip inner-CV search. "
+            "Without --config the pipeline runs in exploratory mode (all models, "
+            "full random search, PCA + UMAP) — identical to the original behaviour."
+        ),
+    )
     return parser.parse_args(argv)
 
 
@@ -151,6 +190,22 @@ def setup_logging(level: str) -> None:
     )
 
 
+def detect_target_type(col: pd.Series) -> str:
+    """Return 'classification' if col contains string labels, 'regression' otherwise.
+
+    Detection logic:
+      - If dtype is object (string) → classification
+      - If coercing to numeric leaves all NaN → classification
+      - Otherwise → regression
+    """
+    if col.dtype == object or col.dtype.name == "category":
+        return "classification"
+    numeric = pd.to_numeric(col.dropna(), errors="coerce")
+    if numeric.isna().all():
+        return "classification"
+    return "regression"
+
+
 # ─────────────────────────────────────────────────────────────
 # Main
 # ─────────────────────────────────────────────────────────────
@@ -159,6 +214,48 @@ def main(argv=None) -> None:
     args = parse_args(argv)
     setup_logging(args.log_level)
     logger = logging.getLogger("ml_analysis")
+
+    # ── Mode selection ─────────────────────────────────────────
+    if args.config is not None:
+        logger.info(f"Mode: CONFIG  ({args.config})")
+        cfg = load_config(args.config)
+        validate_config(cfg)
+        settings = apply_config(cfg, args)
+        logger.info(
+            f"  dimreduce methods : {settings['dimreduce_methods']}\n"
+            f"  clf model filter  : {settings['clf_model_filter']}\n"
+            f"  clf fixed params  : {list(settings['clf_fixed_params'])}\n"
+            f"  reg model filter  : {settings['reg_model_filter']}\n"
+            f"  reg fixed params  : {list(settings['reg_fixed_params'])}"
+        )
+    else:
+        logger.info("Mode: EXPLORATORY  (all models, full random search, PCA + UMAP)")
+        settings = exploratory_settings(args)
+
+    # Unpack settings into local variables for readability
+    n_jobs           = settings["n_jobs"]
+    random_state     = settings["random_state"]
+    corr_threshold   = settings["corr_threshold"]
+    clf_n_outer_folds = settings["clf_n_outer_folds"]
+    clf_n_inner_folds = settings["clf_n_inner_folds"]
+    clf_n_iter        = settings["clf_n_iter"]
+    clf_use_smote     = settings["clf_use_smote"]
+    reg_n_outer_folds = settings["reg_n_outer_folds"]
+    reg_n_inner_folds = settings["reg_n_inner_folds"]
+    reg_n_iter        = settings["reg_n_iter"]
+    umap_n_neighbors = settings["umap_n_neighbors"]
+    umap_min_dist    = settings["umap_min_dist"]
+    skip_dimreduce      = settings["skip_dimreduce"]
+    skip_classification = settings["skip_classification"]
+    skip_regression     = settings["skip_regression"]
+    skip_explain        = settings["skip_explain"]
+    dimreduce_methods   = settings["dimreduce_methods"]
+    clf_model_filter    = settings["clf_model_filter"]
+    clf_fixed_params    = settings["clf_fixed_params"]
+    reg_model_filter    = settings["reg_model_filter"]
+    reg_fixed_params    = settings["reg_fixed_params"]
+    targets_list        = settings["targets_list"]
+    explain_targets     = settings["explain_targets"]
 
     # Validate inputs
     if not args.csv.exists():
@@ -171,8 +268,6 @@ def main(argv=None) -> None:
     out = args.output_dir
     out.mkdir(parents=True, exist_ok=True)
 
-    random_state = args.random_state
-
     # ══════════════════════════════════════════════════════════
     # STEP 1: Feature extraction
     # ══════════════════════════════════════════════════════════
@@ -183,8 +278,9 @@ def main(argv=None) -> None:
     df = load_feature_matrix(
         csv_path=args.csv,
         pose_records_dir=args.pose_records,
-        n_jobs=args.n_jobs,
+        n_jobs=n_jobs,
         debug_n=args.debug_n,
+        extra_meta_cols=ALL_TARGET_COLS,
     )
 
     if df.empty:
@@ -206,21 +302,13 @@ def main(argv=None) -> None:
 
     logger.info(f"Feature matrix: {X_raw.shape[0]} subjects × {X_raw.shape[1]} features")
 
-    # Clinical meta for downstream use
-    clinical_cols = ["uuid", "diagnosis", "gender", "Ados_2_Age", "ADOS_2_TOTAL", "Ados_2_Module"]
+    # Clinical meta for downstream use — load all potential target columns (+identifiers)
+    base_meta_cols = ["uuid", "Ados_2_Age", "Ados_2_Module"]
+    present_target_cols = [c for c in ALL_TARGET_COLS if c in df.columns]
+    clinical_cols = base_meta_cols + present_target_cols
     df_meta = df[[c for c in clinical_cols if c in df.columns]].copy()
 
-    # ── Binary labels (ASD=1, TD=0) ───────────────────────────
-    y_clf_all = (df_meta["diagnosis"] == "ASD").astype(int).values if "diagnosis" in df_meta else None
-
-    # ── Continuous ADOS scores ─────────────────────────────────
-    if "ADOS_2_TOTAL" in df_meta.columns:
-        ados = pd.to_numeric(df_meta["ADOS_2_TOTAL"], errors="coerce")
-        valid_ados_mask = ados.notna().values
-        y_reg_all = ados.values.astype(float)
-    else:
-        valid_ados_mask = np.zeros(len(df), dtype=bool)
-        y_reg_all = None
+    # gender and age are always prepended as input features (never used as targets)
 
     # ══════════════════════════════════════════════════════════
     # STEP 2: Feature selection report (informational, full dataset)
@@ -234,7 +322,7 @@ def main(argv=None) -> None:
         generate_feature_selection_report(
             X=X_df,
             output_dir=preproc_dir,
-            corr_threshold=args.corr_threshold,
+            corr_threshold=corr_threshold,
         )
     except Exception as exc:
         logger.warning(f"Feature selection report failed: {exc}")
@@ -243,16 +331,28 @@ def main(argv=None) -> None:
     # STEP 3: Dimensionality reduction
     # ══════════════════════════════════════════════════════════
     dimreduce_result = {}
-    if not args.skip_dimreduce:
+    if not skip_dimreduce:
         logger.info("=" * 65)
-        logger.info("STEP 3: Dimensionality reduction (PCA + UMAP)")
+        active_methods = " + ".join(m.upper() for m in dimreduce_methods)
+        logger.info(f"STEP 3: Dimensionality reduction ({active_methods})")
         logger.info("=" * 65)
+
+        # Build minimal df_meta for dimreduce (uuid + diagnosis needed for coloring)
+        dimreduce_meta_cols = [
+            "uuid", "diagnosis", "gender", "Ados_2_Age",
+            "ADOS_2_TOTAL", "Ados_2_Module",
+            "ADOS_2_ADOS_G_REVISED_RRB_SEVERITY_SCORE_new",
+            "ADOS_2_ADOS_G_REVISED_SA_SEVERITY_SCORE",
+            "ADOS_G_ADOS_2_TOTAL_score_de_severite",
+        ]
+        df_meta_dimreduce = df_meta[[c for c in dimreduce_meta_cols
+                                     if c in df_meta.columns]].copy()
 
         # Apply the full preprocessing pipeline (missingness → impute → near-zero-var
         # → correlation filter → RobustScaler) so that highly correlated features do
         # not artificially concentrate variance in the first PCA components.
         from .preprocessing import build_preprocessing_pipeline, get_pipeline_feature_names
-        preproc_dimreduce = build_preprocessing_pipeline(corr_threshold=args.corr_threshold)
+        preproc_dimreduce = build_preprocessing_pipeline(corr_threshold=corr_threshold)
         X_scaled = preproc_dimreduce.fit_transform(X_raw)
         feature_names_filtered = get_pipeline_feature_names(preproc_dimreduce, feature_names)
         logger.info(
@@ -263,13 +363,14 @@ def main(argv=None) -> None:
         try:
             dimreduce_result = run_dimensionality_reduction(
                 X_scaled=X_scaled,
-                df_meta=df_meta,
+                df_meta=df_meta_dimreduce,
                 feature_names=feature_names_filtered,
                 output_dir=out,
                 use_gpu=args.use_gpu,
-                umap_n_neighbors=args.umap_n_neighbors,
-                umap_min_dist=args.umap_min_dist,
+                umap_n_neighbors=umap_n_neighbors,
+                umap_min_dist=umap_min_dist,
                 random_state=random_state,
+                methods=dimreduce_methods,
             )
         except Exception as exc:
             logger.error(f"Dimensionality reduction failed: {exc}", exc_info=True)
@@ -277,114 +378,189 @@ def main(argv=None) -> None:
         logger.info("STEP 3: Skipped (--skip-dimreduce)")
 
     # ══════════════════════════════════════════════════════════
-    # STEP 4: Classification (ASD vs TD)
+    # STEPS 4-6: Multi-target loop (classification + regression + SHAP)
     # ══════════════════════════════════════════════════════════
-    df_cv_clf = None
-    if not args.skip_classification and y_clf_all is not None:
-        logger.info("=" * 65)
-        logger.info("STEP 4: Classification (ASD vs TD)")
-        logger.info("=" * 65)
+    logger.info("=" * 65)
+    logger.info(f"STEPS 4-6: Multi-target loop ({len(targets_list)} targets)")
+    logger.info("=" * 65)
 
-        logger.info(
-            f"  ASD: {(y_clf_all == 1).sum()}, TD: {(y_clf_all == 0).sum()}, "
-            f"Total: {len(y_clf_all)}"
-        )
-        try:
-            df_cv_clf = run_classification(
-                X=X_raw,
-                y=y_clf_all,
-                df_meta=df_meta,
-                feature_names=feature_names,
-                output_dir=out,
-                n_outer=args.n_outer_folds,
-                n_inner=args.n_inner_folds,
-                n_iter=args.n_iter,
-                corr_threshold=args.corr_threshold,
-                use_gpu=args.use_gpu,
-                n_jobs=args.n_jobs,
-                random_state=random_state,
+    from sklearn.preprocessing import LabelEncoder
+
+    # Store CV results per target for the final summary
+    target_cv_results: dict[str, tuple[str, pd.DataFrame]] = {}
+
+    for target_col in targets_list:
+        logger.info("─" * 65)
+        logger.info(f"Target: {target_col!r}")
+        logger.info("─" * 65)
+
+        if target_col not in df_meta.columns:
+            logger.warning(f"  '{target_col}' not found in CSV — skipping")
+            continue
+
+        col_series = df_meta[target_col]
+        task_type = detect_target_type(col_series)
+
+        # ── Build valid-subject mask ───────────────────────────
+        if task_type == "classification":
+            valid_mask = (
+                col_series.notna()
+                & (col_series.astype(str).str.strip() != "")
+                & (col_series.astype(str).str.lower() != "nan")
             )
-        except Exception as exc:
-            logger.error(f"Classification failed: {exc}", exc_info=True)
-    elif args.skip_classification:
-        logger.info("STEP 4: Skipped (--skip-classification)")
-    else:
-        logger.info("STEP 4: Skipped (no diagnosis column found)")
+        else:
+            numeric_col = pd.to_numeric(col_series, errors="coerce")
+            valid_mask = numeric_col.notna()
 
-    # ══════════════════════════════════════════════════════════
-    # STEP 5: Regression (ADOS-2 total)
-    # ══════════════════════════════════════════════════════════
-    df_cv_reg = None
-    if not args.skip_regression and y_reg_all is not None and valid_ados_mask.sum() >= 10:
-        logger.info("=" * 65)
-        logger.info("STEP 5: Regression (ADOS-2 total score)")
-        logger.info("=" * 65)
+        n_valid = int(valid_mask.sum())
+        if n_valid < 10:
+            logger.warning(f"  '{target_col}': only {n_valid} valid subjects — skipping (need ≥10)")
+            continue
 
-        # Restrict to subjects with valid ADOS
-        X_reg = X_raw[valid_ados_mask]
-        y_reg = y_reg_all[valid_ados_mask]
-        df_meta_reg = df_meta[valid_ados_mask].reset_index(drop=True)
-        logger.info(f"  Subjects with valid ADOS: {valid_ados_mask.sum()}")
+        X_t = X_raw[valid_mask.values]
+        df_meta_t = df_meta[valid_mask].reset_index(drop=True)
 
-        try:
-            df_cv_reg = run_regression(
-                X=X_reg,
-                y=y_reg,
-                df_meta=df_meta_reg,
-                feature_names=feature_names,
-                output_dir=out,
-                n_outer=args.n_outer_folds,
-                n_inner=args.n_inner_folds,
-                n_iter=args.n_iter,
-                corr_threshold=args.corr_threshold,
-                use_gpu=args.use_gpu,
-                n_jobs=args.n_jobs,
-                random_state=random_state,
+        # ── Classification ────────────────────────────────────
+        if task_type == "classification":
+            if skip_classification:
+                logger.info(f"  '{target_col}': classification skipped (--skip-classification)")
+                continue
+
+            le = LabelEncoder()
+            y_t = le.fit_transform(col_series[valid_mask].astype(str).values)
+            label_names = list(le.classes_)
+            n_classes = len(label_names)
+
+            if n_classes < 2:
+                logger.warning(
+                    f"  '{target_col}': only {n_classes} class in this split — skipping"
+                )
+                continue
+
+            logger.info(
+                f"  '{target_col}': {n_classes}-class classification, n={n_valid}, "
+                f"classes={label_names}"
             )
-        except Exception as exc:
-            logger.error(f"Regression failed: {exc}", exc_info=True)
-    elif args.skip_regression:
-        logger.info("STEP 5: Skipped (--skip-regression)")
-    else:
-        logger.info(f"STEP 5: Skipped (only {valid_ados_mask.sum()} subjects with valid ADOS)")
 
-    # ══════════════════════════════════════════════════════════
-    # STEP 6: SHAP explainability
-    # ══════════════════════════════════════════════════════════
-    if not args.skip_explain and df_cv_clf is not None:
-        logger.info("=" * 65)
-        logger.info("STEP 6: SHAP explainability")
-        logger.info("=" * 65)
-
-        y_reg_explain = None
-        df_meta_reg_explain = None
-        X_reg_explain = X_raw
-
-        if df_cv_reg is not None and valid_ados_mask.sum() >= 10:
-            y_reg_explain = y_reg_all[valid_ados_mask]
-            X_reg_explain = X_raw[valid_ados_mask]
-            df_meta_reg_explain = df_meta[valid_ados_mask].reset_index(drop=True)
-
-        try:
-            run_explainability(
-                X=X_raw,
-                y_clf=y_clf_all,
-                y_reg=y_reg_explain if df_cv_reg is not None else None,
-                df_meta=df_meta,
-                feature_names=feature_names,
-                df_cv_clf=df_cv_clf,
-                df_cv_reg=df_cv_reg,
-                output_dir=out,
-                corr_threshold=args.corr_threshold,
-                use_gpu=args.use_gpu,
-                random_state=random_state,
+            # Save label-encoding map
+            enc_path = out / "classification" / target_col
+            enc_path.mkdir(parents=True, exist_ok=True)
+            pd.DataFrame({"label": label_names, "encoded": range(n_classes)}).to_csv(
+                enc_path / "label_encoding.csv", index=False
             )
-        except Exception as exc:
-            logger.error(f"Explainability failed: {exc}", exc_info=True)
-    elif args.skip_explain:
-        logger.info("STEP 6: Skipped (--skip-explain)")
-    else:
-        logger.info("STEP 6: Skipped (classification step was not run)")
+
+            df_cv = None
+            try:
+                df_cv = run_classification(
+                    X=X_t,
+                    y=y_t,
+                    df_meta=df_meta_t,
+                    feature_names=feature_names,
+                    output_dir=out,
+                    target_name=target_col,
+                    n_classes=n_classes,
+                    label_names=label_names,
+                    y_strat=build_strat_label_from_y(y_t),
+                    n_outer=clf_n_outer_folds,
+                    n_inner=clf_n_inner_folds,
+                    n_iter=clf_n_iter,
+                    corr_threshold=corr_threshold,
+                    use_gpu=args.use_gpu,
+                    n_jobs=n_jobs,
+                    random_state=random_state,
+                    model_filter=clf_model_filter,
+                    fixed_params=clf_fixed_params,
+                    use_smote=clf_use_smote,
+                )
+                if df_cv is not None:
+                    target_cv_results[target_col] = ("classification", df_cv)
+            except Exception as exc:
+                logger.error(f"  Classification '{target_col}' failed: {exc}", exc_info=True)
+
+            # SHAP for this target
+            if (
+                not skip_explain
+                and target_col in explain_targets
+                and df_cv is not None
+            ):
+                try:
+                    run_explainability(
+                        X=X_t,
+                        y_clf=y_t,
+                        y_reg=None,
+                        df_meta=df_meta_t,
+                        feature_names=feature_names,
+                        df_cv_clf=df_cv,
+                        df_cv_reg=None,
+                        output_dir=out,
+                        target_name=target_col,
+                        n_classes=n_classes,
+                        corr_threshold=corr_threshold,
+                        use_gpu=args.use_gpu,
+                        random_state=random_state,
+                    )
+                except Exception as exc:
+                    logger.error(f"  SHAP '{target_col}' failed: {exc}", exc_info=True)
+
+        # ── Regression ────────────────────────────────────────
+        else:
+            if skip_regression:
+                logger.info(f"  '{target_col}': regression skipped (--skip-regression)")
+                continue
+
+            y_t = pd.to_numeric(col_series[valid_mask], errors="coerce").values.astype(float)
+            logger.info(
+                f"  '{target_col}': regression, n={n_valid}, "
+                f"range=[{y_t.min():.2f}, {y_t.max():.2f}]"
+            )
+
+            df_cv = None
+            try:
+                df_cv = run_regression(
+                    X=X_t,
+                    y=y_t,
+                    df_meta=df_meta_t,
+                    feature_names=feature_names,
+                    output_dir=out,
+                    target_name=target_col,
+                    n_outer=reg_n_outer_folds,
+                    n_inner=reg_n_inner_folds,
+                    n_iter=reg_n_iter,
+                    corr_threshold=corr_threshold,
+                    use_gpu=args.use_gpu,
+                    n_jobs=n_jobs,
+                    random_state=random_state,
+                    model_filter=reg_model_filter,
+                    fixed_params=reg_fixed_params,
+                )
+                if df_cv is not None:
+                    target_cv_results[target_col] = ("regression", df_cv)
+            except Exception as exc:
+                logger.error(f"  Regression '{target_col}' failed: {exc}", exc_info=True)
+
+            # SHAP for this target
+            if (
+                not skip_explain
+                and target_col in explain_targets
+                and df_cv is not None
+            ):
+                try:
+                    run_explainability(
+                        X=X_t,
+                        y_clf=None,
+                        y_reg=y_t,
+                        df_meta=df_meta_t,
+                        feature_names=feature_names,
+                        df_cv_clf=None,
+                        df_cv_reg=df_cv,
+                        output_dir=out,
+                        target_name=target_col,
+                        corr_threshold=corr_threshold,
+                        use_gpu=args.use_gpu,
+                        random_state=random_state,
+                    )
+                except Exception as exc:
+                    logger.error(f"  SHAP '{target_col}' failed: {exc}", exc_info=True)
 
     # ══════════════════════════════════════════════════════════
     # Summary
@@ -393,21 +569,22 @@ def main(argv=None) -> None:
     logger.info("ML PIPELINE COMPLETE")
     logger.info("=" * 65)
     logger.info(f"Results saved to: {out.resolve()}")
+    logger.info(f"Completed {len(target_cv_results)}/{len(targets_list)} targets")
 
-    if df_cv_clf is not None:
-        best_clf = df_cv_clf.groupby("model")["auc_roc"].mean().idxmax()
-        best_auc = df_cv_clf.groupby("model")["auc_roc"].mean().max()
-        logger.info(f"  Classification best model: {best_clf} (mean AUC={best_auc:.3f})")
-
-    if df_cv_reg is not None:
-        best_reg = df_cv_reg.groupby("model")["rmse"].mean().idxmin()
-        best_rmse = df_cv_reg.groupby("model")["rmse"].mean().min()
-        best_r2 = df_cv_reg[df_cv_reg["model"] == best_reg]["r2"].mean()
-        logger.info(
-            f"  Regression best model: {best_reg} "
-            f"(mean RMSE={best_rmse:.3f}, R²={best_r2:.3f})"
-        )
+    for target_col, (task_type, df_cv) in target_cv_results.items():
+        if task_type == "classification":
+            best_m = df_cv.groupby("model")["auc_roc"].mean().idxmax()
+            best_v = df_cv.groupby("model")["auc_roc"].mean().max()
+            logger.info(f"  [{target_col}] best: {best_m} (AUC={best_v:.3f})")
+        else:
+            best_m = df_cv.groupby("model")["rmse"].mean().idxmin()
+            best_rmse = df_cv.groupby("model")["rmse"].mean().min()
+            best_r2 = df_cv[df_cv["model"] == best_m]["r2"].mean()
+            logger.info(
+                f"  [{target_col}] best: {best_m} (RMSE={best_rmse:.3f}, R²={best_r2:.3f})"
+            )
 
 
 if __name__ == "__main__":
     main()
+

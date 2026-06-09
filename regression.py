@@ -41,7 +41,7 @@ from joblib import Parallel, delayed
 from scipy.stats import pearsonr, spearmanr, wilcoxon
 from sklearn.linear_model import ElasticNet
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
-from sklearn.model_selection import RandomizedSearchCV, StratifiedKFold
+from sklearn.model_selection import KFold, RandomizedSearchCV, StratifiedKFold
 from sklearn.svm import SVR
 from sklearn.tree import DecisionTreeRegressor
 from sklearn.ensemble import RandomForestRegressor
@@ -66,10 +66,17 @@ PALETTE_MODELS = {
 # Model definitions
 # ─────────────────────────────────────────────────────────────
 
-def _build_models(use_gpu: bool = False, n_jobs: int = -1, random_state: int = 42):
+def _build_models(use_gpu: bool = False, n_jobs: int = -1, random_state: int = 42,
+                  model_filter: list[str] | None = None):
+    """Return dict of (model_id → (estimator, param_distributions)).
+
+    Args:
+        model_filter: If given, only models whose id is in this list are returned.
+                      None (default) returns all available models.
+    """
     try:
         from xgboost import XGBRegressor
-        xgb_device = "cuda" if use_gpu else "hist"
+        xgb_device = "cuda" if use_gpu else "cpu"
         xgb_est = XGBRegressor(
             device=xgb_device, random_state=random_state, nthread=max(1, n_jobs),
         )
@@ -146,6 +153,20 @@ def _build_models(use_gpu: bool = False, n_jobs: int = -1, random_state: int = 4
     if lgbm_est is not None:
         models["lgbm"] = (lgbm_est, lgbm_params)
 
+    if model_filter is not None:
+        missing = set(model_filter) - set(models)
+        if missing:
+            logger.warning(
+                f"Config requested model(s) not available: {sorted(missing)}. "
+                "They will be skipped."
+            )
+        models = {k: v for k, v in models.items() if k in model_filter}
+        if not models:
+            raise ValueError(
+                f"No valid regression models after filtering. "
+                f"Requested: {model_filter}"
+            )
+
     return models
 
 
@@ -155,7 +176,7 @@ def _build_models(use_gpu: bool = False, n_jobs: int = -1, random_state: int = 4
 
 def build_ados_strat(ados: pd.Series, n_bins: int = 5) -> np.ndarray:
     """
-    Bin ADOS scores into quintiles for stratified CV.
+    Bin continuous scores into quintiles for stratified CV.
     Returns integer bin labels array aligned to ados.index.
     """
     try:
@@ -163,6 +184,10 @@ def build_ados_strat(ados: pd.Series, n_bins: int = 5) -> np.ndarray:
     except ValueError:
         bins = pd.cut(ados, bins=n_bins, labels=False)
     return bins.fillna(-1).astype(int).values
+
+
+# Alias for backward compatibility
+build_reg_strat = build_ados_strat
 
 
 # ─────────────────────────────────────────────────────────────
@@ -182,12 +207,21 @@ def _run_one_fold(
     corr_threshold: float,
     random_state: int,
     n_jobs_inner: int,
+    fixed_params: dict | None = None,
 ) -> list[dict]:
+    """Run all models for one outer fold. Returns list of result dicts.
+
+    Args:
+        fixed_params: Optional mapping of model_id → {param: value}.
+                      When present for a model, those hyperparameters are applied
+                      directly and inner-CV search is skipped for that model.
+    """
     X_train, X_test = X[train_idx], X[test_idx]
     y_train, y_test = y[train_idx], y[test_idx]
     strat_train = ados_strat[train_idx]
 
-    inner_cv = StratifiedKFold(n_splits=n_inner, shuffle=True, random_state=random_state)
+    inner_cv = KFold(n_splits=n_inner, shuffle=True, random_state=random_state)
+    fixed_params = fixed_params or {}
     fold_results = []
 
     for model_id, (estimator, param_dist) in model_defs.items():
@@ -197,18 +231,32 @@ def _run_one_fold(
         preproc = build_preprocessing_pipeline(corr_threshold=corr_threshold)
         pipe = Pipeline(list(preproc.steps) + [("model", est)])
 
-        search = RandomizedSearchCV(
-            pipe, param_dist,
-            n_iter=n_iter, scoring="neg_root_mean_squared_error", cv=inner_cv,
-            n_jobs=n_jobs_inner, random_state=random_state,
-            refit=True, error_score=np.nan,
-        )
+        if model_id in fixed_params:
+            # Config mode: apply fixed hyperparameters, skip inner CV
+            for param, value in fixed_params[model_id].items():
+                pipe.set_params(**{f"model__{param}": value})
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                pipe.fit(X_train, y_train)
+            best = pipe
+            best_params_str = str({f"model__{k}": v
+                                    for k, v in fixed_params[model_id].items()})
+        else:
+            search = RandomizedSearchCV(
+                pipe, param_dist,
+                n_iter=n_iter, scoring="neg_root_mean_squared_error", cv=inner_cv,
+                n_jobs=n_jobs_inner, random_state=random_state,
+                refit=True, error_score=np.nan,
+            )
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                search.fit(X_train, y_train)
+            best = search.best_estimator_
+            best_params_str = str(search.best_params_)
+
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
-            search.fit(X_train, y_train)
-
-        best = search.best_estimator_
-        y_pred = best.predict(X_test)
+            y_pred = best.predict(X_test)
 
         rmse = float(np.sqrt(mean_squared_error(y_test, y_pred)))
         mae = float(mean_absolute_error(y_test, y_pred))
@@ -229,7 +277,7 @@ def _run_one_fold(
             "spearman_p": float(spearman_p),
             "pearson_r": float(pearson_r),
             "pearson_p": float(pearson_p),
-            "best_params": str(search.best_params_),
+            "best_params": best_params_str,
             "y_pred": y_pred.tolist(),
             "y_test": y_test.tolist(),
             "test_indices": test_idx.tolist(),  # row indices in original X / df_meta
@@ -252,6 +300,7 @@ def run_regression(
     df_meta: pd.DataFrame,
     feature_names: list[str],
     output_dir: Path,
+    target_name: str = "target",
     n_outer: int = 5,
     n_inner: int = 3,
     n_iter: int = 50,
@@ -259,38 +308,49 @@ def run_regression(
     use_gpu: bool = False,
     n_jobs: int = 4,
     random_state: int = 42,
+    model_filter: list[str] | None = None,
+    fixed_params: dict | None = None,
 ) -> pd.DataFrame:
     """
-    Run nested cross-validated regression for all models.
+    Run nested cross-validated regression for all (or a subset of) models.
 
     Args:
         X: Feature matrix (n_subjects × n_features), raw (preprocessing inside CV).
-        y: Continuous ADOS-2 total score array.
+        y: Continuous target score array.
         df_meta: Clinical metadata (same row order as X).
         feature_names: Feature column names.
         output_dir: Root output directory.
+        target_name: Name of the target column; used as output sub-directory name.
         n_outer / n_inner: Number of folds.
         n_iter: RandomizedSearchCV iterations.
         corr_threshold: Correlation filter threshold.
         use_gpu: Enable GPU for XGB/LGBM.
         n_jobs: Parallel outer fold jobs.
         random_state: Random seed.
+        model_filter: List of model IDs to run. None = all available models (exploratory).
+        fixed_params: Dict mapping model_id → {param: value}. Models listed here use
+                      fixed hyperparameters instead of inner-CV random search.
 
     Returns:
         DataFrame of per-fold per-model scores.
     """
-    out = output_dir / "regression"
+
+    logger.info("Starting regression analysis with nested CV of {} outer folds and {} inner folds".format(n_outer, n_inner))
+    out = output_dir / "regression" / target_name
     out.mkdir(parents=True, exist_ok=True)
 
-    ados_series = pd.to_numeric(
-        df_meta.get("ADOS_2_TOTAL", pd.Series(np.nan, index=df_meta.index)), errors="coerce"
-    )
-    ados_strat = build_ados_strat(ados_series)
+    # Stratification: bin y directly into quintiles
+    y_series = pd.Series(y)
+    ados_strat = build_ados_strat(y_series)
     diag_series = df_meta.get("diagnosis", pd.Series("unknown", index=df_meta.index))
 
     # Always use CPU for XGB/LGBM during CV (same rationale as classification).
-    model_defs = _build_models(use_gpu=False, n_jobs=1, random_state=random_state)
+    model_defs = _build_models(use_gpu=False, n_jobs=1, random_state=random_state,
+                               model_filter=model_filter)
+    fixed_params = fixed_params or {}
     logger.info(f"Regression: {len(model_defs)} models, {n_outer}×{n_inner} nested CV")
+    if fixed_params:
+        logger.info(f"  Fixed hyperparams (no inner CV) for: {sorted(fixed_params)}")
 
     outer_cv = StratifiedKFold(n_splits=n_outer, shuffle=True, random_state=random_state)
     splits = list(outer_cv.split(X, ados_strat))
@@ -309,6 +369,7 @@ def run_regression(
             corr_threshold=corr_threshold,
             random_state=random_state,
             n_jobs_inner=-1,
+            fixed_params=fixed_params,
         )
         for i, (train, test) in enumerate(splits)
     )
@@ -336,8 +397,8 @@ def run_regression(
                     "fold": r["fold"],
                     "model": model_id,
                     "uuid": uuids[idx],
-                    "y_true_ados": float(yt),
-                    "y_pred_ados": float(yp),
+                    "y_true": float(yt),
+                    "y_pred": float(yp),
                     "residual": float(yp - yt),
                 }
                 if diag_vals is not None:
@@ -363,8 +424,8 @@ def run_regression(
     for model_id, preds in raw_preds.items():
         y_pred_all = np.array(preds["y_pred"])
         y_test_all = np.array(preds["y_test"])
-        _plot_pred_vs_actual(y_test_all, y_pred_all, model_id, out)
-        _plot_residuals(y_test_all, y_pred_all, model_id, out)
+        _plot_pred_vs_actual(y_test_all, y_pred_all, model_id, out, target_name=target_name)
+        _plot_residuals(y_test_all, y_pred_all, model_id, out, target_name=target_name)
 
     summary = df_cv.groupby("model")[["rmse", "r2", "spearman_r"]].mean().reset_index()
     logger.info("\n── Regression summary ──\n" + summary.to_string(index=False))
@@ -417,7 +478,7 @@ def _model_comparison(df_cv: pd.DataFrame, metric: str = "rmse") -> pd.DataFrame
 # Figures
 # ─────────────────────────────────────────────────────────────
 
-def _plot_pred_vs_actual(y_true, y_pred, model_id, out):
+def _plot_pred_vs_actual(y_true, y_pred, model_id, out, target_name: str = "target"):
     fig, ax = plt.subplots(figsize=(6, 5))
     ax.scatter(y_true, y_pred, alpha=0.65, s=40, color=PALETTE_MODELS.get(model_id, "steelblue"),
                edgecolors="white", linewidths=0.4)
@@ -440,8 +501,8 @@ def _plot_pred_vs_actual(y_true, y_pred, model_id, out):
     rmse = float(np.sqrt(mean_squared_error(y_true, y_pred)))
     r2 = float(r2_score(y_true, y_pred))
 
-    ax.set_xlabel("True ADOS-2 Total", fontsize=11)
-    ax.set_ylabel("Predicted ADOS-2 Total", fontsize=11)
+    ax.set_xlabel(f"True {target_name}", fontsize=11)
+    ax.set_ylabel(f"Predicted {target_name}", fontsize=11)
     ax.set_title(
         f"{model_id.upper()} — Predicted vs Actual\n"
         f"RMSE={rmse:.2f}, R²={r2:.3f}, ρ={rho:.3f}, r={r:.3f}",
@@ -455,7 +516,7 @@ def _plot_pred_vs_actual(y_true, y_pred, model_id, out):
     logger.info(f"  Saved: predicted_vs_actual_{model_id}.png")
 
 
-def _plot_residuals(y_true, y_pred, model_id, out):
+def _plot_residuals(y_true, y_pred, model_id, out, target_name: str = "target"):
     residuals = y_pred - y_true
     fig, axes = plt.subplots(1, 2, figsize=(11, 4))
 
@@ -475,7 +536,7 @@ def _plot_residuals(y_true, y_pred, model_id, out):
                color=PALETTE_MODELS.get(model_id, "steelblue"),
                edgecolors="white", linewidths=0.4)
     ax.axhline(0, color="black", linestyle="--", lw=1.2)
-    ax.set_xlabel("Predicted ADOS-2 Total", fontsize=10)
+    ax.set_xlabel(f"Predicted {target_name}", fontsize=10)
     ax.set_ylabel("Residual", fontsize=10)
     ax.set_title(f"{model_id.upper()} — Residuals vs Predicted", fontsize=11)
     ax.spines[["top", "right"]].set_visible(False)

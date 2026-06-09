@@ -1,0 +1,115 @@
+# poseMLAnalysis — multi-target config
+# ======================================
+# Runs nested-CV for all 33 clinical target variables.
+#
+# Type detection is automatic at runtime:
+#   string/object columns  → multi-class classification
+#   float/numeric columns  → regression
+#
+# Classification targets (string labels):
+#   diagnosis                                        (binary:   ASD / TD)
+#   ADOS_2_ADOS_G_revised_RRB_level_of_symptoms      (3-class)
+#   ADOS_2_ADOS_G_REVISED_SA_LEVEL_OF_SYMPTOMS       (4-class)
+#   ADOS_G_REVISED_ADOS_2_TOTAL_Level_of_symptoms    (4-class)
+#
+# Regression targets (numeric):
+#   ADOS-2 severity scores, Vineland-II subscales, Mullen DQ scores
+#
+# Note: gender and Ados_2_Age are kept as INPUT FEATURES, not targets.
+#
+# Usage:
+#   python -m poseMLAnalysis.run_ml \
+#       --csv dataset/info/child_for_humanlisbet_paper_with_paths_020326.csv \
+#       --pose-records dataset/pose_records \
+#       --output-dir poseMLAnalysis/results_multitarget \
+#       --config poseMLAnalysis/config_multitarget.yaml \
+#       --use-gpu --log-level INFO
+
+# ── Targets to run ───────────────────────────────────────────
+# Remove any entry to skip that target.
+targets:
+  # ── ADOS-2 classification (string labels) ──────────────────
+  - diagnosis
+  - ADOS_2_ADOS_G_revised_RRB_level_of_symptoms
+  - ADOS_2_ADOS_G_REVISED_SA_LEVEL_OF_SYMPTOMS
+  # ── ADOS-2 regression (numeric scores) ─────────────────────
+  - ADOS_2_ADOS_G_REVISED_RRB_SEVERITY_SCORE_new
+  - ADOS_2_ADOS_G_REVISED_SA_SEVERITY_SCORE
+  - ADOS_2_SOCIAL_AFECT_TOTAL
+  # - ADOS_2_TOTAL
+  - ADOS_G_ADOS_2_TOTAL_score_de_severite
+  # ── Vineland-II (VLDII) — all regression ───────────────────
+  - VLDII_AdSS
+  - VLDII_MotorSS
+  - VLDII_gmsVS
+  - VLDII_fmsVS
+  - VLDII_SocSS
+  - VLDII_intVS
+  - VLDII_plaVS
+  - VLDII_copVS
+  - VLDII_DaiSS
+  - VLDII_perVS
+  - VLDII_comVS
+  - VLDII_domVS
+  - VLDII_ComSS
+  - VLDII_expVS
+  - VLDII_recVS
+  # ── Mullen (MSEL) — all regression ─────────────────────────
+  - MSEL_TOTAL_DQ
+  - MSEL_FM_DQ
+  - MSEL_VR_DQ
+  - MSEL_LR_DQ
+  - MSEL_LE_DQ
+  - MSEL_NV_DQ
+  - MSEL_V_DQ
+  - MSEL_GM_DQ
+
+# ── Global settings ───────────────────────────────────────────
+global:
+  n_jobs:          16
+  random_state:    42
+  corr_threshold:  0.95
+
+# ── Dimensionality reduction ──────────────────────────────────
+dimreduce:
+  methods: ['pca']     # skipped (empty list) — runs per-target, uncomment to enable globally
+
+# ── Classification ────────────────────────────────────────────
+classification:
+  enabled:       false
+  n_outer_folds: 5
+  n_inner_folds: 3
+  n_iter:        50
+  smote:         true
+
+  models:
+    rf:
+      enabled: false
+    xgb:
+      enabled: false
+    lgbm:
+      enabled: true
+
+# ── Regression ────────────────────────────────────────────────
+regression:
+  enabled:       false
+  n_outer_folds: 5
+  n_inner_folds: 3
+  n_iter:        50
+
+  models:
+    rf:
+      enabled: false
+    xgb:
+      enabled: false
+    lgbm:
+      enabled: true
+
+# ── SHAP explainability ───────────────────────────────────────
+# List only the targets for which you want SHAP (can be slow for 33 targets).
+explain:
+  enabled: false
+  targets:
+    - diagnosis
+    - ADOS_G_ADOS_2_TOTAL_score_de_severite
+    - ADOS_G_REVISED_ADOS_2_TOTAL_Level_of_symptoms

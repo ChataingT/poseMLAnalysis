@@ -202,6 +202,7 @@ def load_feature_matrix(
     pose_records_dir: Path,
     n_jobs: int = 4,
     debug_n: int | None = None,
+    extra_meta_cols: list[str] | None = None,
 ) -> pd.DataFrame:
     """Load the clinical CSV, extract frame-level features for each subject,
     and return a merged DataFrame ready for ML.
@@ -241,8 +242,13 @@ def load_feature_matrix(
     skipped: list[str] = []
 
     clinical_cols = [
-        "uuid", "diagnosis", "gender", "Ados_2_Age", "ADOS_2_TOTAL", "Ados_2_Module",
+        "uuid", "diagnosis", "gender", "Ados_2_Age", "ADOS_2_TOTAL",
+        "ADOS_G_ADOS_2_TOTAL_score_de_severite", "Ados_2_Module",
     ]
+    if extra_meta_cols:
+        for c in extra_meta_cols:
+            if c not in clinical_cols:
+                clinical_cols.append(c)
 
     for (subject_id, features), (_, meta_row) in zip(results, meta.iterrows()):
         if features is None:

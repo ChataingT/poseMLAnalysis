@@ -145,13 +145,15 @@ def _transform_without_model(pipe, X: np.ndarray) -> np.ndarray:
 # ─────────────────────────────────────────────────────────────
 
 def _get_shap_values(model_id: str, fitted_model, X_transformed: np.ndarray,
-                     task: str, random_state: int = 42):
+                     task: str, random_state: int = 42, n_classes: int = 2):
     """
     Compute SHAP values using the appropriate explainer.
 
     Returns:
         shap_values: ndarray of shape (n_samples, n_features)
-                     For binary classification: SHAP values for the positive class (ASD).
+                     For binary classification: SHAP values for the positive class.
+                     For multi-class classification: mean of |SHAP| across classes.
+                     For regression: raw SHAP values.
         explainer: fitted SHAP explainer object.
     """
     try:
@@ -168,26 +170,36 @@ def _get_shap_values(model_id: str, fitted_model, X_transformed: np.ndarray,
         if model_id in tree_models:
             explainer = shap.TreeExplainer(fitted_model.named_steps["model"])
             sv = explainer.shap_values(X_transformed)
-            # For classifiers, shap_values may be a list [class0, class1]
+            # For binary classifiers, shap_values may be a list [class0, class1]
             if isinstance(sv, list) and len(sv) == 2:
-                sv = sv[1]  # positive class (ASD)
-            # For multi-output: take first output
-            if sv.ndim == 3:
-                sv = sv[:, :, 1]
+                sv = sv[1]  # positive class
+            # For multi-class classifiers: average |SHAP| across classes
+            elif isinstance(sv, list) and len(sv) > 2:
+                sv = np.mean(np.stack([np.abs(s) for s in sv], axis=0), axis=0)
+            # For multi-output: take mean absolute across last axis
+            if isinstance(sv, np.ndarray) and sv.ndim == 3:
+                sv = np.abs(sv).mean(axis=2) if sv.shape[2] == n_classes else sv[:, :, 1]
 
         elif model_id in linear_models:
             background = shap.maskers.Independent(X_transformed, max_samples=100)
             explainer = shap.LinearExplainer(fitted_model.named_steps["model"], background)
             sv = explainer.shap_values(X_transformed)
-            if isinstance(sv, list):
+            if isinstance(sv, list) and len(sv) == 2:
                 sv = sv[1]
+            elif isinstance(sv, list) and len(sv) > 2:
+                sv = np.mean(np.stack([np.abs(s) for s in sv], axis=0), axis=0)
 
         else:
             # Kernel explainer (SVM, SVR)
             background = shap.kmeans(X_transformed, min(50, X_transformed.shape[0]))
-            if task == "classification":
+            if task == "classification" and n_classes == 2:
                 def predict_fn(x):
                     return fitted_model.named_steps["model"].predict_proba(x)[:, 1]
+            elif task == "classification" and n_classes > 2:
+                # For multi-class kernel SHAP use predicted class probability max
+                def predict_fn(x):
+                    proba = fitted_model.named_steps["model"].predict_proba(x)
+                    return proba.max(axis=1)
             else:
                 def predict_fn(x):
                     return fitted_model.named_steps["model"].predict(x)
@@ -497,13 +509,15 @@ def _shorten_name(name: str, maxlen: int = 45) -> str:
 
 def run_explainability(
     X: np.ndarray,
-    y_clf: np.ndarray,
+    y_clf: np.ndarray | None,
     y_reg: np.ndarray | None,
     df_meta: pd.DataFrame,
     feature_names: list[str],
-    df_cv_clf: pd.DataFrame,
+    df_cv_clf: pd.DataFrame | None,
     df_cv_reg: pd.DataFrame | None,
     output_dir: Path,
+    target_name: str = "target",
+    n_classes: int = 2,
     corr_threshold: float = 0.95,
     use_gpu: bool = False,
     random_state: int = 42,
@@ -513,18 +527,20 @@ def run_explainability(
 
     Args:
         X: Raw feature matrix (preprocessing done inside this function).
-        y_clf: Binary labels (0=TD, 1=ASD).
-        y_reg: Continuous ADOS scores (None to skip regression explain).
+        y_clf: Integer-encoded labels (None to skip classification explain).
+        y_reg: Continuous target scores (None to skip regression explain).
         df_meta: Clinical metadata.
         feature_names: Names of columns in X.
-        df_cv_clf: Classification CV results DataFrame.
+        df_cv_clf: Classification CV results DataFrame (or None).
         df_cv_reg: Regression CV results DataFrame (or None).
         output_dir: Root output directory.
+        target_name: Target column name, used as output sub-directory name.
+        n_classes: Number of classes (for classification).
         corr_threshold: Preprocessing correlation threshold.
         use_gpu: Use GPU for tree models.
         random_state: Random seed.
     """
-    out = output_dir / "explain"
+    out = output_dir / "explain" / target_name
     out.mkdir(parents=True, exist_ok=True)
 
     from .classification import _build_models as clf_models
@@ -532,36 +548,41 @@ def run_explainability(
 
     # ── Classification ────────────────────────────────────────
     logger.info("── SHAP: Classification ──")
-    try:
-        best_clf_id, pipe_clf, X_clf_t, names_clf = _retrain_best(
-            df_cv=df_cv_clf,
-            X=X,
-            y=y_clf,
-            metric="auc_roc",
-            lower_is_better=False,
-            model_builder=clf_models,
-            corr_threshold=corr_threshold,
-            random_state=random_state,
-            use_gpu=use_gpu,
-            input_feature_names=feature_names,
-        )
-        shap_clf, explainer_clf = _get_shap_values(
-            best_clf_id, pipe_clf, X_clf_t, task="classification", random_state=random_state
-        )
-        _save_shap_data(shap_clf, X_clf_t, names_clf, df_meta,
-                        "classification", best_clf_id, out)
-        _plot_beeswarm(shap_clf, X_clf_t, names_clf, "classification", best_clf_id, out)
-        _plot_bar(shap_clf, names_clf, "classification", best_clf_id, out)
-        _plot_dependence(shap_clf, X_clf_t, names_clf, "classification", best_clf_id, out)
+    if y_clf is not None and df_cv_clf is not None:
+        try:
+            best_clf_id, pipe_clf, X_clf_t, names_clf = _retrain_best(
+                df_cv=df_cv_clf,
+                X=X,
+                y=y_clf,
+                metric="auc_roc",
+                lower_is_better=False,
+                model_builder=clf_models,
+                corr_threshold=corr_threshold,
+                random_state=random_state,
+                use_gpu=use_gpu,
+                input_feature_names=feature_names,
+            )
+            shap_clf, explainer_clf = _get_shap_values(
+                best_clf_id, pipe_clf, X_clf_t, task="classification",
+                random_state=random_state, n_classes=n_classes,
+            )
+            _save_shap_data(shap_clf, X_clf_t, names_clf, df_meta,
+                            "classification", best_clf_id, out)
+            _plot_beeswarm(shap_clf, X_clf_t, names_clf, "classification", best_clf_id, out)
+            _plot_bar(shap_clf, names_clf, "classification", best_clf_id, out)
+            _plot_dependence(shap_clf, X_clf_t, names_clf, "classification", best_clf_id, out)
 
-        # Local: need probability predictions
-        y_prob_clf = pipe_clf.predict_proba(X)[:, 1]
-        _plot_waterfalls(shap_clf, X_clf_t, names_clf, y_clf, y_prob_clf,
-                         best_clf_id, out)
-        logger.info(f"  Classification SHAP complete (model: {best_clf_id})")
+            # Waterfall plots: binary classification only
+            if n_classes == 2:
+                y_prob_clf = pipe_clf.predict_proba(X)[:, 1]
+                _plot_waterfalls(shap_clf, X_clf_t, names_clf, y_clf, y_prob_clf,
+                                 best_clf_id, out)
+            logger.info(f"  Classification SHAP complete (model: {best_clf_id})")
 
-    except Exception as exc:
-        logger.error(f"  Classification SHAP failed: {exc}", exc_info=True)
+        except Exception as exc:
+            logger.error(f"  Classification SHAP failed: {exc}", exc_info=True)
+    else:
+        logger.info("  Classification SHAP skipped (no clf results)")
 
     # ── Regression ────────────────────────────────────────────
     if y_reg is not None and df_cv_reg is not None:
@@ -582,9 +603,7 @@ def run_explainability(
             shap_reg, explainer_reg = _get_shap_values(
                 best_reg_id, pipe_reg, X_reg_t, task="regression", random_state=random_state
             )
-            # Use df_meta subset that matches y_reg (subjects with valid ADOS)
-            df_meta_reg = df_meta.iloc[:len(X_reg_t)].reset_index(drop=True) if len(X_reg_t) < len(df_meta) else df_meta
-            _save_shap_data(shap_reg, X_reg_t, names_reg, df_meta_reg,
+            _save_shap_data(shap_reg, X_reg_t, names_reg, df_meta,
                             "regression", best_reg_id, out)
             _plot_beeswarm(shap_reg, X_reg_t, names_reg, "regression", best_reg_id, out)
             _plot_bar(shap_reg, names_reg, "regression", best_reg_id, out)
@@ -593,3 +612,5 @@ def run_explainability(
 
         except Exception as exc:
             logger.error(f"  Regression SHAP failed: {exc}", exc_info=True)
+    else:
+        logger.info("  Regression SHAP skipped (no reg results)")

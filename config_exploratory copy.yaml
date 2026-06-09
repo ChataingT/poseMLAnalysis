@@ -1,0 +1,125 @@
+# poseMLAnalysis — full exploratory config
+# ==========================================
+# This file reproduces the default exploratory mode exactly.
+# Delete or comment out any model / method you do not want to run.
+# Add a "params:" block under a model to fix its hyperparameters
+# and skip the inner cross-validation search for that model.
+#
+# Usage:
+#   python -m poseMLAnalysis.run_ml \
+#       --csv ... --pose-records ... \
+#       --config poseMLAnalysis/config_exploratory.yaml
+
+# ── Global settings ───────────────────────────────────────────
+global:
+  n_jobs:          16      # parallel workers
+  random_state:    42
+  corr_threshold:  0.95    # Pearson |r| threshold for correlation filter
+
+# ── Dimensionality reduction ──────────────────────────────────
+dimreduce:
+  methods: [pca, umap]     # remove "pca" or "umap" to skip it
+  umap:
+    n_neighbors: 15
+    min_dist:    0.1
+
+# ── Classification (ASD vs TD) ────────────────────────────────
+classification:
+  enabled:       true
+  n_outer_folds: 5
+  n_inner_folds: 3
+  n_iter:        50        # RandomizedSearchCV iterations per model per fold
+
+  models:
+    dt:                    # Decision Tree
+      enabled: true
+      # params:            # uncomment + fill to fix hyperparams (skips inner CV)
+      #   max_depth: 4
+      #   min_samples_leaf: 2
+      #   criterion: gini
+
+    lr:                    # Logistic Regression (ElasticNet)
+      enabled: true
+      # params:
+      #   C: 1.0
+      #   l1_ratio: 0.5
+
+    svm:                   # SVM (RBF kernel)
+      enabled: true
+      # params:
+      #   C: 1.0
+      #   gamma: scale
+
+    rf:                    # Random Forest
+      enabled: true
+      # params:
+      #   max_depth: null   # null = no limit
+      #   min_samples_leaf: 1
+      #   max_features: sqrt
+
+    xgb:                   # XGBoost (skipped if not installed)
+      enabled: true
+      # params:
+      #   n_estimators: 300
+      #   max_depth: 5
+      #   learning_rate: 0.05
+
+    lgbm:                  # LightGBM (skipped if not installed)
+      enabled: true
+      # params:
+      #   n_estimators: 300
+      #   max_depth: 5
+      #   learning_rate: 0.05
+
+# ── Regression (ADOS-2 total score) ──────────────────────────
+regression:
+  enabled:       true
+  n_outer_folds: 5
+  n_inner_folds: 3
+  n_iter:        50
+
+  models:
+    dt:                    # Decision Tree Regressor
+      enabled: true
+      # params:
+      #   max_depth: 4
+      #   min_samples_leaf: 2
+      #   criterion: squared_error
+
+    ridge:                 # ElasticNet
+      enabled: true
+      # params:
+      #   alpha: 1.0
+      #   l1_ratio: 0.5
+
+    svr:                   # SVR (RBF kernel)
+      enabled: true
+      # params:
+      #   C: 1.0
+      #   gamma: scale
+      #   epsilon: 0.1
+
+    rf:                    # Random Forest Regressor
+      enabled: true
+      # params:
+      #   max_depth: null
+      #   min_samples_leaf: 1
+      #   max_features: sqrt
+
+    xgb:                   # XGBoost Regressor (skipped if not installed)
+      enabled: true
+      # params:
+      #   n_estimators: 300
+      #   max_depth: 5
+      #   learning_rate: 0.05
+
+    lgbm:                  # LightGBM Regressor (skipped if not installed)
+      enabled: true
+      # params:
+      #   n_estimators: 300
+      #   max_depth: 5
+      #   learning_rate: 0.05
+
+# ── SHAP explainability ───────────────────────────────────────
+explain:
+  enabled: true

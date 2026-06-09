@@ -113,7 +113,7 @@ def _get_clinical_series(df_meta: pd.DataFrame):
     diag = df_meta.get("diagnosis", pd.Series(np.nan, index=df_meta.index))
     gender_raw = df_meta.get("gender", pd.Series(np.nan, index=df_meta.index))
     age = pd.to_numeric(df_meta.get("Ados_2_Age", pd.Series(np.nan, index=df_meta.index)), errors="coerce")
-    ados = pd.to_numeric(df_meta.get("ADOS_2_TOTAL", pd.Series(np.nan, index=df_meta.index)), errors="coerce")
+    ados = pd.to_numeric(df_meta.get("ADOS_G_ADOS_2_TOTAL_score_de_severite", pd.Series(np.nan, index=df_meta.index)), errors="coerce")
     return diag, gender_raw, age, ados
 
 
@@ -149,6 +149,12 @@ def run_pca(
     coords = pca.fit_transform(X_scaled)
 
     diag, gender, age, ados = _get_clinical_series(df_meta)
+    ados_rrb = pd.to_numeric(df_meta.get("ADOS_2_ADOS_G_REVISED_RRB_SEVERITY_SCORE_new",
+                                          pd.Series(np.nan, index=df_meta.index)), errors="coerce")
+    ados_sa  = pd.to_numeric(df_meta.get("ADOS_2_ADOS_G_REVISED_SA_SEVERITY_SCORE",
+                                          pd.Series(np.nan, index=df_meta.index)), errors="coerce")
+    ados_total = pd.to_numeric(df_meta.get("ADOS_G_ADOS_2_TOTAL_score_de_severite",
+                                            pd.Series(np.nan, index=df_meta.index)), errors="coerce")
 
     evr = pca.explained_variance_ratio_
     cumulative = np.cumsum(evr)
@@ -200,7 +206,7 @@ def run_pca(
     emb_df.insert(1, "diagnosis", diag.values)
     emb_df.insert(2, "gender", gender.values)
     emb_df.insert(3, "Ados_2_Age", age.values)
-    emb_df.insert(4, "ADOS_2_TOTAL", ados.values)
+    emb_df.insert(4, "ADOS_G_ADOS_2_TOTAL_score_de_severite", ados.values)
     emb_df.to_csv(out / "pca_embedding.csv", index=False)
     logger.info("  Saved data: pca_embedding.csv")
 
@@ -238,9 +244,27 @@ def run_pca(
 
     # ── Scatter by ADOS ───────────────────────────────────────
     fig, ax = plt.subplots(figsize=(6, 5))
-    _scatter_continuous(ax, emb2, ados, "PCA — ADOS-2 Total")
+    _scatter_continuous(ax, emb2, ados, "PCA — ADOS-G Severity Score")
     _style_ax(ax, xlabel, ylabel)
     _save(fig, out / "pca_scatter_ados.png")
+
+    # ── Scatter by ADOS RRB severity score ───────────────────
+    fig, ax = plt.subplots(figsize=(6, 5))
+    _scatter_continuous(ax, emb2, ados_rrb, "PCA — ADOS-2 RRB Severity Score")
+    _style_ax(ax, xlabel, ylabel)
+    _save(fig, out / "pca_scatter_ados_rrb_severity.png")
+
+    # ── Scatter by ADOS SA severity score ────────────────────
+    fig, ax = plt.subplots(figsize=(6, 5))
+    _scatter_continuous(ax, emb2, ados_sa, "PCA — ADOS-2 SA Severity Score")
+    _style_ax(ax, xlabel, ylabel)
+    _save(fig, out / "pca_scatter_ados_sa_severity.png")
+
+    # ── Scatter by ADOS-G total severity score ───────────────
+    fig, ax = plt.subplots(figsize=(6, 5))
+    _scatter_continuous(ax, emb2, ados_total, "PCA — ADOS-G Total Severity Score")
+    _style_ax(ax, xlabel, ylabel)
+    _save(fig, out / "pca_scatter_ados_total_severity.png")
 
     # ── Biplot (top N loading vectors) ────────────────────────
     if feature_names is not None and len(feature_names) == X_scaled.shape[1]:
@@ -330,7 +354,7 @@ def run_umap(
 
     # ── Scatter by ADOS ───────────────────────────────────────
     fig, ax = plt.subplots(figsize=(6, 5))
-    _scatter_continuous(ax, emb2, ados, "UMAP — ADOS-2 Total")
+    _scatter_continuous(ax, emb2, ados, "UMAP — ADOS-G Severity Score")
     _style_ax(ax, xlabel, ylabel)
     _save(fig, out / "umap_scatter_ados.png")
 
@@ -343,7 +367,7 @@ def run_umap(
     umap_df.insert(1, "diagnosis", diag.values)
     umap_df.insert(2, "gender", gender.values)
     umap_df.insert(3, "Ados_2_Age", age.values)
-    umap_df.insert(4, "ADOS_2_TOTAL", ados.values)
+    umap_df.insert(4, "ADOS_G_ADOS_2_TOTAL_score_de_severite", ados.values)
     umap_df.to_csv(out / "umap_embedding.csv", index=False)
     logger.info("  Saved data: umap_embedding.csv")
 
@@ -497,9 +521,10 @@ def run_dimensionality_reduction(
     umap_n_neighbors: int = 15,
     umap_min_dist: float = 0.1,
     random_state: int = 42,
+    methods: list[str] | None = None,
 ) -> dict:
     """
-    Run PCA + UMAP, save all figures, return embeddings.
+    Run PCA and/or UMAP, save all figures, return embeddings.
 
     Args:
         X_scaled: Preprocessed, scaled feature matrix (n_subjects × n_features).
@@ -509,28 +534,49 @@ def run_dimensionality_reduction(
         use_gpu: Try cuml for UMAP.
         umap_n_neighbors, umap_min_dist: UMAP hyperparameters.
         random_state: Random seed.
+        methods: Subset of ["pca", "umap"] to run. Defaults to both.
 
     Returns:
-        dict with keys "pca_emb", "umap_emb", "pca_model".
+        dict with keys "pca_emb", "umap_emb", "pca_model" (absent keys are None).
     """
-    logger.info("── Dimensionality reduction: PCA ──")
-    pca_emb, pca_model = run_pca(
-        X_scaled, df_meta, output_dir,
-        feature_names=feature_names,
-    )
-    evr = pca_model.explained_variance_ratio_
-    pca_var = (evr[0] * 100, evr[1] * 100 if len(evr) > 1 else 0.0)
+    if methods is None:
+        methods = ["pca", "umap"]
+    methods = [m.lower() for m in methods]
 
-    logger.info("── Dimensionality reduction: UMAP ──")
-    umap_emb = run_umap(
-        X_scaled, df_meta, output_dir,
-        n_neighbors=umap_n_neighbors,
-        min_dist=umap_min_dist,
-        use_gpu=use_gpu,
-        random_state=random_state,
-    )
+    result: dict = {"pca_emb": None, "umap_emb": None, "pca_model": None}
 
-    logger.info("── Combined PCA + UMAP panels ──")
-    plot_combined_panels(pca_emb, umap_emb, df_meta, pca_var, output_dir)
+    pca_emb = None
+    pca_var = (0.0, 0.0)
 
-    return {"pca_emb": pca_emb, "umap_emb": umap_emb, "pca_model": pca_model}
+    if "pca" in methods:
+        logger.info("── Dimensionality reduction: PCA ──")
+        pca_emb, pca_model = run_pca(
+            X_scaled, df_meta, output_dir,
+            feature_names=feature_names,
+        )
+        evr = pca_model.explained_variance_ratio_
+        pca_var = (evr[0] * 100, evr[1] * 100 if len(evr) > 1 else 0.0)
+        result["pca_emb"] = pca_emb
+        result["pca_model"] = pca_model
+    else:
+        logger.info("── Dimensionality reduction: PCA skipped (not in methods) ──")
+
+    umap_emb = None
+    if "umap" in methods:
+        logger.info("── Dimensionality reduction: UMAP ──")
+        umap_emb = run_umap(
+            X_scaled, df_meta, output_dir,
+            n_neighbors=umap_n_neighbors,
+            min_dist=umap_min_dist,
+            use_gpu=use_gpu,
+            random_state=random_state,
+        )
+        result["umap_emb"] = umap_emb
+    else:
+        logger.info("── Dimensionality reduction: UMAP skipped (not in methods) ──")
+
+    if pca_emb is not None and umap_emb is not None:
+        logger.info("── Combined PCA + UMAP panels ──")
+        plot_combined_panels(pca_emb, umap_emb, df_meta, pca_var, output_dir)
+
+    return result

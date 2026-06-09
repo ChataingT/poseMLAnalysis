@@ -46,6 +46,7 @@ from sklearn.metrics import (
     balanced_accuracy_score,
     confusion_matrix,
     f1_score,
+    make_scorer,
     roc_auc_score,
     roc_curve,
 )
@@ -78,11 +79,17 @@ PALETTE_MODELS = {
 # Model definitions
 # ─────────────────────────────────────────────────────────────
 
-def _build_models(use_gpu: bool = False, n_jobs: int = -1, random_state: int = 42):
-    """Return dict of (model_id → (estimator, param_distributions))."""
+def _build_models(use_gpu: bool = False, n_jobs: int = -1, random_state: int = 42,
+                  model_filter: list[str] | None = None, n_classes: int = 2):
+    """Return dict of (model_id → (estimator, param_distributions)).
+
+    Args:
+        model_filter: If given, only models whose id is in this list are returned.
+                      None (default) returns all available models.
+    """
     try:
         from xgboost import XGBClassifier
-        xgb_device = "cuda" if use_gpu else "hist"
+        xgb_device = "cuda" if use_gpu else "cpu"
         xgb_est = XGBClassifier(
             device=xgb_device, eval_metric="logloss",
             random_state=random_state, nthread=max(1, n_jobs),
@@ -104,10 +111,20 @@ def _build_models(use_gpu: bool = False, n_jobs: int = -1, random_state: int = 4
     try:
         from lightgbm import LGBMClassifier
         lgbm_device = "gpu" if use_gpu else "cpu"
-        lgbm_est = LGBMClassifier(
-            device=lgbm_device, class_weight="balanced",
-            random_state=random_state, n_jobs=n_jobs, verbose=-1,
-        )
+        # Binary: use is_unbalance (LightGBM doc recommends against class_weight for binary).
+        # Multi-class: use class_weight='balanced' (is_unbalance is binary-only).
+        if n_classes == 2:
+            lgbm_est = LGBMClassifier(
+                device=lgbm_device,
+                is_unbalance=True,
+                random_state=random_state, n_jobs=n_jobs, verbose=-1,
+            )
+        else:
+            lgbm_est = LGBMClassifier(
+                device=lgbm_device,
+                class_weight="balanced",
+                random_state=random_state, n_jobs=n_jobs, verbose=-1,
+            )
         lgbm_params = {
             "model__n_estimators": [100, 300, 500],
             "model__max_depth": [3, 5, 7, -1],
@@ -167,6 +184,20 @@ def _build_models(use_gpu: bool = False, n_jobs: int = -1, random_state: int = 4
     if lgbm_est is not None:
         models["lgbm"] = (lgbm_est, lgbm_params)
 
+    if model_filter is not None:
+        missing = set(model_filter) - set(models)
+        if missing:
+            logger.warning(
+                f"Config requested model(s) not available: {sorted(missing)}. "
+                "They will be skipped."
+            )
+        models = {k: v for k, v in models.items() if k in model_filter}
+        if not models:
+            raise ValueError(
+                f"No valid classification models after filtering. "
+                f"Requested: {model_filter}"
+            )
+
     return models
 
 
@@ -194,16 +225,37 @@ def build_strat_label(df: pd.DataFrame) -> pd.Series:
     return strat
 
 
+def build_strat_label_from_y(y: np.ndarray) -> np.ndarray:
+    """Build stratification array directly from integer-encoded class labels.
+
+    For classification targets where diagnosis/ADOS meta is unavailable,
+    we simply stratify on the label values themselves.
+    """
+    return y.astype(int)
+
+
 # ─────────────────────────────────────────────────────────────
 # SMOTE helper
 # ─────────────────────────────────────────────────────────────
 
-def _make_pipeline_with_smote(estimator, preprocessing_pipeline, random_state=42):
-    """Build an imbalanced-learn Pipeline with SMOTE + preprocessing + model."""
+def _make_pipeline_with_smote(estimator, preprocessing_pipeline,
+                               random_state=42, use_smote=True, k_neighbors=5):
+    """Build a pipeline with optional SMOTE oversampling + preprocessing + model.
+
+    Args:
+        use_smote: When True (default) include SMOTE in an imbalanced-learn Pipeline.
+                   Set to False to use a plain sklearn Pipeline (no oversampling).
+    """
+    from sklearn.pipeline import Pipeline as SkPipeline
+    base_steps = list(preprocessing_pipeline.steps) + [("model", estimator)]
+
+    if not use_smote:
+        return SkPipeline(base_steps)
+
     try:
         from imblearn.pipeline import Pipeline as ImbPipeline
         from imblearn.over_sampling import SMOTE
-        smote = SMOTE(random_state=random_state, k_neighbors=5)
+        smote = SMOTE(random_state=random_state, k_neighbors=k_neighbors)
         steps = list(preprocessing_pipeline.steps) + [
             ("smote", smote),
             ("model", estimator),
@@ -211,9 +263,7 @@ def _make_pipeline_with_smote(estimator, preprocessing_pipeline, random_state=42
         return ImbPipeline(steps)
     except ImportError:
         logger.warning("imbalanced-learn not available; SMOTE disabled")
-        from sklearn.pipeline import Pipeline
-        steps = list(preprocessing_pipeline.steps) + [("model", estimator)]
-        return Pipeline(steps)
+        return SkPipeline(base_steps)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -233,58 +283,121 @@ def _run_one_fold(
     corr_threshold: float,
     random_state: int,
     n_jobs_inner: int,
+    fixed_params: dict | None = None,
+    use_smote: bool = True,
+    n_classes: int = 2,
 ) -> list[dict]:
-    """Run all models for one outer fold. Returns list of result dicts."""
+    """Run all models for one outer fold. Returns list of result dicts.
+
+    Args:
+        fixed_params: Optional mapping of model_id → {param: value}.
+                      When present for a model, those hyperparameters are applied
+                      directly and inner-CV search is skipped for that model.
+        use_smote: When False, SMOTE oversampling is disabled (useful when class
+                   sizes are too small for the default k_neighbors=5).
+        n_classes: Number of target classes (2 = binary, >2 = multi-class).
+    """
     X_train, X_test = X[train_idx], X[test_idx]
     y_train, y_test = y[train_idx], y[test_idx]
     strat_train = strat[train_idx]
 
     inner_cv = StratifiedKFold(n_splits=n_inner, shuffle=True, random_state=random_state)
+    fixed_params = fixed_params or {}
     fold_results = []
+
+    # Adaptive SMOTE: k_neighbors must be < smallest minority class size in this fold
+    min_class_count = int(np.bincount(y_train.astype(int)).min())
+    smote_k = max(1, min(5, min_class_count - 1))
+    if smote_k < 1:
+        use_smote = False
+
+    # Choose inner-CV scoring based on number of classes
+    if n_classes > 2:
+        inner_scoring = make_scorer(
+            roc_auc_score, needs_proba=True, multi_class="ovr", average="macro"
+        )
+    else:
+        inner_scoring = "roc_auc"
 
     for model_id, (estimator, param_dist) in model_defs.items():
         import copy
         est = copy.deepcopy(estimator)
         preproc = build_preprocessing_pipeline(corr_threshold=corr_threshold)
-        pipe = _make_pipeline_with_smote(est, preproc, random_state=random_state)
+        pipe = _make_pipeline_with_smote(est, preproc, random_state=random_state,
+                                         use_smote=use_smote and model_id != "lgbm",
+                                         k_neighbors=smote_k)
 
-        search = RandomizedSearchCV(
-            pipe, param_dist,
-            n_iter=n_iter, scoring="roc_auc", cv=inner_cv,
-            n_jobs=n_jobs_inner, random_state=random_state,
-            refit=True, error_score=np.nan,
-        )
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            search.fit(X_train, y_train, **_smote_fit_params(pipe))
+        if model_id in fixed_params:
+            # Config mode: apply fixed hyperparameters, skip inner CV
+            for param, value in fixed_params[model_id].items():
+                pipe.set_params(**{f"model__{param}": value})
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                pipe.fit(X_train, y_train)
+            best = pipe
+            best_params_str = str({f"model__{k}": v
+                                    for k, v in fixed_params[model_id].items()})
+        else:
+            search = RandomizedSearchCV(
+                pipe, param_dist,
+                n_iter=n_iter, scoring=inner_scoring, cv=inner_cv,
+                n_jobs=n_jobs_inner, random_state=random_state,
+                refit=True, error_score=np.nan,
+            )
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                search.fit(X_train, y_train, **_smote_fit_params(pipe))
+            best = search.best_estimator_
+            best_params_str = str(search.best_params_)
 
-        best = search.best_estimator_
 
         # Predictions
-        y_prob = best.predict_proba(X_test)[:, 1]
-        y_pred = best.predict(X_test)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            y_prob_full = best.predict_proba(X_test)  # shape (n_test, n_classes)
+            y_pred = best.predict(X_test)
 
-        auc = roc_auc_score(y_test, y_prob)
+        # AUC: binary uses 1-D prob of positive class; multi-class uses OvR macro
+        if n_classes == 2:
+            y_prob = y_prob_full[:, 1]  # 1-D for binary (backward-compatible)
+            try:
+                auc = roc_auc_score(y_test, y_prob)
+            except Exception:
+                auc = np.nan
+        else:
+            y_prob = y_prob_full  # 2-D for multi-class
+            try:
+                auc = roc_auc_score(y_test, y_prob, multi_class="ovr", average="macro")
+            except Exception:
+                auc = np.nan
+
         bacc = balanced_accuracy_score(y_test, y_pred)
         f1_macro = f1_score(y_test, y_pred, average="macro", zero_division=0)
         f1_weighted = f1_score(y_test, y_pred, average="weighted", zero_division=0)
 
-        cm = confusion_matrix(y_test, y_pred, labels=[0, 1])
-        tn, fp, fn, tp = cm.ravel() if cm.size == 4 else (0, 0, 0, 0)
-        sensitivity = tp / (tp + fn) if (tp + fn) > 0 else np.nan
-        specificity = tn / (tn + fp) if (tn + fp) > 0 else np.nan
+        # sensitivity / specificity only meaningful for binary
+        if n_classes == 2:
+            cm = confusion_matrix(y_test, y_pred, labels=[0, 1])
+            tn, fp, fn, tp = cm.ravel() if cm.size == 4 else (0, 0, 0, 0)
+            sensitivity = tp / (tp + fn) if (tp + fn) > 0 else np.nan
+            specificity = tn / (tn + fp) if (tn + fp) > 0 else np.nan
+        else:
+            sensitivity = np.nan
+            specificity = np.nan
 
         fold_results.append({
             "fold": fold_idx,
             "model": model_id,
+            "n_classes": n_classes,
             "auc_roc": auc,
             "balanced_acc": bacc,
             "f1_macro": f1_macro,
             "f1_weighted": f1_weighted,
             "sensitivity": sensitivity,
             "specificity": specificity,
-            "best_params": str(search.best_params_),
-            "y_prob": y_prob.tolist(),
+            "best_params": best_params_str,
+            # y_prob: 1-D list for binary, 2-D list for multi-class
+            "y_prob": y_prob.tolist() if isinstance(y_prob, np.ndarray) else y_prob_full.tolist(),
             "y_test": y_test.tolist(),
             "y_pred": y_pred.tolist(),
             "test_indices": test_idx.tolist(),  # row indices in original X / df_meta
@@ -313,6 +426,10 @@ def run_classification(
     df_meta: pd.DataFrame,
     feature_names: list[str],
     output_dir: Path,
+    target_name: str = "default",
+    n_classes: int = 2,
+    label_names: list[str] | None = None,
+    y_strat: np.ndarray | None = None,
     n_outer: int = 5,
     n_inner: int = 3,
     n_iter: int = 50,
@@ -320,43 +437,69 @@ def run_classification(
     use_gpu: bool = False,
     n_jobs: int = 4,
     random_state: int = 42,
+    model_filter: list[str] | None = None,
+    fixed_params: dict | None = None,
+    use_smote: bool = True,
 ) -> pd.DataFrame:
     """
-    Run nested cross-validated classification for all models.
+    Run nested cross-validated classification for all (or a subset of) models.
 
     Args:
         X: Feature matrix (n_subjects × n_features), already imputed/scaled.
            Pass the RAW (un-preprocessed) features; preprocessing is done inside CV.
-        y: Binary label array (0=TD, 1=ASD).
-        df_meta: Clinical metadata (same row order as X), used for stratification.
+        y: Integer-encoded label array (0, 1, …, n_classes-1).
+        df_meta: Clinical metadata (same row order as X), used for stratification
+                 fallback (diagnosis × ADOS tertile) when y_strat is None.
         feature_names: Feature column names.
         output_dir: Root output directory.
+        target_name: Name of the target column; used as output sub-directory name.
+        n_classes: Number of distinct classes in y.
+        label_names: Human-readable class names aligned to encoded integers.
+        y_strat: Pre-built stratification array (same length as y). When None,
+                 falls back to build_strat_label(df_meta).
         n_outer / n_inner: Number of folds.
         n_iter: RandomizedSearchCV iterations.
         corr_threshold: Correlation filter threshold (passed to preprocessing pipeline).
         use_gpu: Enable GPU for XGB/LGBM.
         n_jobs: Parallel jobs for outer fold loop.
         random_state: Random seed.
+        model_filter: List of model IDs to run. None = all available models (exploratory).
+        fixed_params: Dict mapping model_id → {param: value}. Models listed here use
+                      fixed hyperparameters instead of inner-CV random search.
+        use_smote: When False, SMOTE oversampling is disabled (set smote: false in config).
 
     Returns:
         DataFrame of per-fold per-model scores.
     """
-    out = output_dir / "classification"
+    logger.info("Starting classification analysis with nested CV of {} outer folds and {} inner folds".format(n_outer, n_inner))
+
+    out = output_dir / "classification" / target_name
     out.mkdir(parents=True, exist_ok=True)
 
-    strat_label = build_strat_label(df_meta)
-    strat_arr = strat_label.values
+    # Stratification: use provided y_strat, else fall back to diagnosis×ADOS label
+    if y_strat is not None:
+        strat_arr = y_strat
+    else:
+        strat_label = build_strat_label(df_meta)
+        strat_arr = strat_label.values
 
     # Always use CPU for XGB/LGBM during CV:  with 119 subjects the GPU
     # data-transfer overhead far exceeds compute time, and running 5 concurrent
     # loky forks each with a LightGBM GPU instance exhausts host memory before
     # the first tree is trained (LightGBM allocates large host-side bin buffers
     # per Booster regardless of dataset size when device='gpu').
-    model_defs = _build_models(use_gpu=False, n_jobs=1, random_state=random_state)
+    model_defs = _build_models(use_gpu=False, n_jobs=1, random_state=random_state,
+                               model_filter=model_filter, n_classes=n_classes)
+    fixed_params = fixed_params or {}
     logger.info(f"Classification: {len(model_defs)} models, {n_outer}×{n_inner} nested CV")
+    if fixed_params:
+        logger.info(f"  Fixed hyperparams (no inner CV) for: {sorted(fixed_params)}")
 
     outer_cv = StratifiedKFold(n_splits=n_outer, shuffle=True, random_state=random_state)
     splits = list(outer_cv.split(X, strat_arr))
+
+    if not use_smote:
+        logger.info("  SMOTE disabled (use_smote=False)")
 
     # Run folds in parallel (n_jobs outer folds)
     all_fold_results = Parallel(n_jobs=min(n_jobs, n_outer), backend="loky")(
@@ -373,6 +516,9 @@ def run_classification(
             corr_threshold=corr_threshold,
             random_state=random_state,
             n_jobs_inner=-1,
+            fixed_params=fixed_params,
+            use_smote=use_smote,
+            n_classes=n_classes,
         )
         for i, (train, test) in enumerate(splits)
     )
@@ -394,28 +540,38 @@ def run_classification(
         fold_idx = r["fold"]
         test_idx_fold = np.array(r["test_indices"])
         y_test_fold = np.array(r["y_test"])
-        y_prob_fold = np.array(r["y_prob"])
+        y_prob_raw = r["y_prob"]
         y_pred_fold = np.array(r["y_pred"])
+        nc = r.get("n_classes", n_classes)
+
+        # y_prob: 1-D for binary, 2-D for multi-class
+        y_prob_fold = np.array(y_prob_raw)
+        # derive scalar probability for the per-subject CSV
+        if nc == 2:
+            y_prob_pos = y_prob_fold  # probability of class 1
+        else:
+            y_prob_pos = y_prob_fold.max(axis=1) if y_prob_fold.ndim == 2 else y_prob_fold
 
         raw_preds[model_id].append({
             "y_test": r["y_test"],
-            "y_prob": r["y_prob"],
+            "y_prob": y_prob_raw,
             "y_pred": r["y_pred"],
+            "n_classes": nc,
         })
 
         # Per-subject prediction rows
-        for idx, yt, yp, ypr in zip(test_idx_fold, y_test_fold, y_pred_fold, y_prob_fold):
+        for idx, yt, yp, ypr in zip(test_idx_fold, y_test_fold, y_pred_fold, y_prob_pos):
             pred_rows.append({
                 "fold": fold_idx,
                 "model": model_id,
                 "uuid": uuids[idx],
                 "y_true": int(yt),
                 "y_pred": int(yp),
-                "y_prob_asd": float(ypr),
+                "y_prob_pos": float(ypr),
             })
 
-        # ROC curve data per fold
-        if len(np.unique(y_test_fold)) > 1:
+        # ROC curve data per fold (binary only)
+        if nc == 2 and len(np.unique(y_test_fold)) > 1:
             fpr_arr, tpr_arr, thr_arr = roc_curve(y_test_fold, y_prob_fold)
             for f, t, thr in zip(fpr_arr, tpr_arr, thr_arr):
                 roc_data_rows.append({
@@ -443,8 +599,9 @@ def run_classification(
     df_cmp.to_csv(out / "model_comparison.csv", index=False)
 
     # ── Figures ───────────────────────────────────────────────
-    _plot_roc_curves(raw_preds, out)
-    _plot_confusion_matrices(raw_preds, y, list(model_defs.keys()), out)
+    _plot_roc_curves(raw_preds, out, n_classes=n_classes)
+    _plot_confusion_matrices(raw_preds, y, list(model_defs.keys()), out,
+                             n_classes=n_classes, label_names=label_names)
     _plot_learning_curves(X, y, strat_arr, model_defs, out,
                           corr_threshold=corr_threshold, random_state=random_state)
 
@@ -503,8 +660,11 @@ def _model_comparison(df_cv: pd.DataFrame, metric: str = "auc_roc") -> pd.DataFr
 # Figures
 # ─────────────────────────────────────────────────────────────
 
-def _plot_roc_curves(raw_preds: dict, out: Path) -> None:
-    """Plot mean ROC curve with ±1 std band for each model."""
+def _plot_roc_curves(raw_preds: dict, out: Path, n_classes: int = 2) -> None:
+    """Plot mean ROC curve with ±1 std band for each model (binary only)."""
+    if n_classes != 2:
+        logger.info("  ROC curve skipped for multi-class target (n_classes=%d)", n_classes)
+        return
     fig, ax = plt.subplots(figsize=(7, 6))
 
     base_fpr = np.linspace(0, 1, 101)
@@ -514,7 +674,11 @@ def _plot_roc_curves(raw_preds: dict, out: Path) -> None:
         aucs = []
         for fd in fold_data:
             y_test = np.array(fd["y_test"])
-            y_prob = np.array(fd["y_prob"])
+            y_prob_raw = fd["y_prob"]
+            y_prob = np.array(y_prob_raw)
+            # For binary, y_prob is 1-D
+            if y_prob.ndim == 2:
+                y_prob = y_prob[:, 1]
             if len(np.unique(y_test)) < 2:
                 continue
             fpr, tpr, _ = roc_curve(y_test, y_prob)
@@ -522,7 +686,6 @@ def _plot_roc_curves(raw_preds: dict, out: Path) -> None:
             interp_tpr[0] = 0.0
             tprs.append(interp_tpr)
             aucs.append(roc_auc_score(y_test, y_prob))
-
         if not tprs:
             continue
 
@@ -541,7 +704,7 @@ def _plot_roc_curves(raw_preds: dict, out: Path) -> None:
     ax.plot([0, 1], [0, 1], "k--", lw=1, alpha=0.5, label="Chance")
     ax.set_xlabel("False Positive Rate", fontsize=11)
     ax.set_ylabel("True Positive Rate", fontsize=11)
-    ax.set_title("ROC Curves — ASD vs TD (Nested CV)", fontsize=12)
+    ax.set_title("ROC Curves (Nested CV)", fontsize=12)
     ax.legend(fontsize=8, framealpha=0.8, loc="lower right")
     ax.spines[["top", "right"]].set_visible(False)
     fig.tight_layout()
@@ -550,8 +713,14 @@ def _plot_roc_curves(raw_preds: dict, out: Path) -> None:
     logger.info("  Saved: roc_curves.png")
 
 
-def _plot_confusion_matrices(raw_preds: dict, y: np.ndarray, model_ids: list, out: Path) -> None:
+def _plot_confusion_matrices(raw_preds: dict, y: np.ndarray, model_ids: list, out: Path,
+                              n_classes: int = 2,
+                              label_names: list[str] | None = None) -> None:
     """Aggregated confusion matrices across all outer folds, one per model."""
+    class_labels = list(range(n_classes))
+    tick_labels = label_names if label_names and len(label_names) == n_classes else [
+        str(i) for i in class_labels
+    ]
     n_models = len(model_ids)
     ncols = min(3, n_models)
     nrows = (n_models + ncols - 1) // ncols
@@ -562,26 +731,27 @@ def _plot_confusion_matrices(raw_preds: dict, y: np.ndarray, model_ids: list, ou
         ax = axes[idx // ncols][idx % ncols]
         fold_data = raw_preds.get(model_id, [])
 
-        cm_total = np.zeros((2, 2), dtype=int)
+        cm_total = np.zeros((n_classes, n_classes), dtype=int)
         for fd in fold_data:
             y_test = np.array(fd["y_test"])
             y_pred = np.array(fd["y_pred"])
-            cm = confusion_matrix(y_test, y_pred, labels=[0, 1])
+            cm = confusion_matrix(y_test, y_pred, labels=class_labels)
             cm_total += cm
 
         im = ax.imshow(cm_total, interpolation="nearest", cmap=plt.cm.Blues)
         ax.set_title(model_id.upper(), fontsize=11)
-        tick_marks = [0, 1]
+        tick_marks = list(range(n_classes))
         ax.set_xticks(tick_marks)
         ax.set_yticks(tick_marks)
-        ax.set_xticklabels(["TD", "ASD"], fontsize=9)
-        ax.set_yticklabels(["TD", "ASD"], fontsize=9)
+        ax.set_xticklabels(tick_labels, fontsize=9, rotation=45 if n_classes > 4 else 0,
+                           ha="right" if n_classes > 4 else "center")
+        ax.set_yticklabels(tick_labels, fontsize=9)
         ax.set_xlabel("Predicted", fontsize=9)
         ax.set_ylabel("True", fontsize=9)
-        for i in range(2):
-            for j in range(2):
+        for i in range(n_classes):
+            for j in range(n_classes):
                 ax.text(j, i, str(cm_total[i, j]),
-                        ha="center", va="center", fontsize=13,
+                        ha="center", va="center", fontsize=max(6, 13 - n_classes),
                         color="white" if cm_total[i, j] > cm_total.max() / 2 else "black")
 
     # Hide unused axes
